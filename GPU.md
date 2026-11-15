@@ -70,7 +70,18 @@ FSM mode requires ACTIVE, direct mode requires OPMODE RUN. Both retain the
 LOCK/output/reset and fixed-frequency checks; no PLL writes are introduced.
 The running-root check repeats this validation and rejects a control-mode change.
 Host tests cover the observed FSM snapshot, inactive/unlocked FSM, direct standby,
-and loss of readiness during the cycle. Hardware verification is pending.
+and loss of readiness during the cycle. The corrected mode-5 test is now
+verified on the Redmi: root CMD changed from 0x80000000 to 0x2 with CFG0x602,
+then returned to CMD0x80000000/CFG0; the original parent gate and CX controls
+were restored. Home/touch stayed functional. The 200-MHz value is nominal from
+PLL/divider configuration, not an independent frequency measurement. Both child
+branches remained disabled and no firmware or rendering command executed.
+
+This hardware test used a locally compiled incremental kernel; the independent
+full CI build of the same source also passed. Local linking uses the standalone
+kernel flags, not the kernel-cache-only LASTDATA_CONST rename/export filtering;
+segment permissions, constructor targets, symbols and payload were checked before
+boot. The permanent boot remains the original working image.
 
 The live DT links GPUCC CX/MX/GFX to those three ARC resources. CX's parent
 relationship includes MX; the existing `ldoc11` helper only implements a PMIC
