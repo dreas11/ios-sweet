@@ -115,6 +115,9 @@ static void dictionary(void)
 int main(void)
 {
     uint16_t good[] = {0,16,48,64,128,256,0,0};
+    uint16_t sweet_cx[16] = {0,16,64,128,192,256,384};
+    uint16_t sweet_mx[16] = {0,16,192,320,384};
+    uint16_t sweet_gfx[16] = {0,16,64,128,192,256,320,384,416};
     uint16_t descending[] = {0,128,64}, hole[] = {0,16,0,64};
     assert(sweet_arc_level_count(good, 8) == 6);
     assert(sweet_arc_level_index(good, 8, 64) == 3);
@@ -124,6 +127,11 @@ int main(void)
     assert(sweet_arc_level_count(hole, 4) == -1);
     assert(sweet_arc_level_count(good, 17) == -1);
     assert(sweet_arc_level_count(NULL, 0) == -1);
+    assert(sweet_arc_level_count(sweet_cx, 16) == 7);
+    assert(sweet_arc_level_count(sweet_mx, 16) == 5);
+    assert(sweet_arc_level_count(sweet_gfx, 16) == 9);
+    assert(sweet_arc_level_index(sweet_mx, 16, 64) == 2);
+    assert(sweet_mx[sweet_arc_level_index(sweet_mx, 16, 64)] == 192);
     reset(); dictionary();
     uint16_t levels[16]; unsigned count = 0; uint32_t address = 0, response = 0;
     assert(!rh_arc_lookup("cx.lvl", &address, levels, &count));
