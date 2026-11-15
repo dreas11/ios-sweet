@@ -27,6 +27,7 @@ ADT gets /chosen/memory-map "RAMDisk" = <phys, size> for IOFindBSDRoot to
 turn into md0 (boot with rd=md0).
 """
 import argparse, os, struct, sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
@@ -140,8 +141,8 @@ def adt_dram(adt_blob):
             struct.unpack('<Q', chosen.prop('dram-size'))[0])
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
-    buf = bytearray(open(kernel_path, 'rb').read())
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, gpu_firmware_path=None):
+    buf = bytearray(Path(kernel_path).read_bytes())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
     segs = [s for s in m['segs'] if s['vmsize']]
@@ -153,13 +154,13 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
     kernel_end = max(s['vmaddr'] + s['vmsize'] for s in segs)
     kernel_end = (kernel_end + PAGE - 1) & ~(PAGE - 1)
 
-    adt_blob = open(adt_path, 'rb').read()
+    adt_blob = Path(adt_path).read_bytes()
     # The ADT decides where the kernel's RAM is (mkadt.py --highmem).
     PHYS_BASE, MEM_SIZE = adt_dram(adt_blob)
     pieces = [(s['vmaddr'], s['vmsize'], buf[s['fileoff']:s['fileoff'] + s['filesize']]) for s in segs]
     ramdisk = None
     if ramdisk_path:
-        image = open(ramdisk_path, 'rb').read()
+        image = Path(ramdisk_path).read_bytes()
         rd_size = (len(image) + PAGE - 1) & ~(PAGE - 1)
         rd_va = kernel_end
         kernel_end = rd_va + rd_size
@@ -167,6 +168,32 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
         pieces.append((rd_va, rd_size, image))
         adt_blob = add_ramdisk_to_adt(adt_blob, rd_pa, rd_size)
         ramdisk = (hex(rd_pa), hex(rd_size))
+
+    gpu_firmware = None
+    if gpu_firmware_path:
+        import gpu_firmware as gpufw
+        if Path(gpu_firmware_path).stat().st_size > gpufw.LIMIT:
+            raise ValueError('GPU firmware bundle exceeds transport limit')
+        image = Path(gpu_firmware_path).read_bytes()
+        entries = gpufw.validate(image)
+        fw_size = (len(image) + PAGE - 1) & ~(PAGE - 1)
+        fw_va = kernel_end
+        fw_pa = fw_va - virt_base + PHYS_BASE
+        root, _ = adt.parse(adt_blob)
+        chosen = next(c for c in root.children if c.name == 'chosen')
+        mmap = next(c for c in chosen.children if c.name == 'memory-map')
+        if mmap.prop('GPUFirmware') is not None:
+            raise ValueError('ADT already has GPUFirmware')
+        mmap.props.append(('GPUFirmware', 0, struct.pack('<2Q', fw_pa, len(image))))
+        adt_blob = adt.serialize(root)
+        # Match shim/loader.c: ADT, then a page containing boot_args.
+        after_adt = (fw_pa + fw_size + len(adt_blob) + PAGE - 1) & ~(PAGE - 1)
+        if fw_pa < PHYS_BASE or after_adt + PAGE > PHYS_BASE + MEM_SIZE:
+            raise ValueError('GPU firmware/boot metadata exceeds kernel-managed RAM')
+        pieces.append((fw_va, fw_size, image))
+        kernel_end += fw_size
+        gpu_firmware = dict(physical_address=hex(fw_pa), bytes=len(image),
+                            reserved_bytes=fw_size, entries=entries)
 
     hdr_size = SEG_TABLE + 32 * len(pieces)
     out = bytearray(hdr_size)
@@ -190,6 +217,8 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
     info = dict(cputype=hex(m['cputype']), cpusub=m['cpusub'], fixups=nfix, virt_base=hex(virt_base),
                 entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk, size=len(out),
                 segs=[(s['name'], hex(s['vmaddr']), hex(s['vmsize'])) for s in segs])
+    if gpu_firmware is not None:
+        info['gpu_firmware'] = gpu_firmware
     return bytes(out), info
 
 
@@ -198,8 +227,9 @@ if __name__ == '__main__':
     ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
+    ap.add_argument('--gpu-firmware', help='validated private SWGPUFW1 bundle; reserve only, no execution')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.gpu_firmware)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':
