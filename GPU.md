@@ -46,7 +46,21 @@ status register. No RPMh vote, clock, GX, core or GMU register write occurs.
 Control restoration is checked; it is not claimed to prove physical OFF because
 the board explicitly specifies no OFF-status poll. Host tests exercise guards,
 success, timeout, readback failures and restoration failures. Full CI build
-passed; temporary mode-4 hardware test is in progress.
+passed and mode 4 is now device-verified: Home/touch stayed functional, CX
+hardware status changed from 0x5ff4 to 0x80001fe0 and back, AHB clock status
+changed to 0x1, and CX/GX/GMU controls were restored. No rendering occurred.
+
+Patch 0087 adds `sweetgpu=5`, a GMU **root-only** clock test inside the proven
+CX cycle. It requires a locked, running fixed 600-MHz GPLL0 (L31, fraction0x4000),
+both GMU child branches disabled/off, and an idle root initially on XO or GPLL0/2.
+It votes only the GPU-specific GPLL0/2 gate, configures parent6/HID2 (nominal
+200 MHz), checks the forced root runs, then restores the root configuration and
+its original parent-gate bit. It never retunes a PLL or enables a GMU/GX branch.
+Unexpected clock rollback leaves CX and the parent powered and stops all further
+GPU operations, rather than removing power from uncertain clock state. Host
+models cover malformed/unavailable registers, active consumers, unrelated parent
+votes, update/enable/disable/restore failures, and the CX keep-powered failure
+path. This stage is not yet hardware-verified and executes no GPU firmware.
 
 The live DT links GPUCC CX/MX/GFX to those three ARC resources. CX's parent
 relationship includes MX; the existing `ldoc11` helper only implements a PMIC

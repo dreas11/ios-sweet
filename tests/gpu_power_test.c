@@ -27,6 +27,7 @@ static void write_reg(void *cookie, unsigned off, uint32_t value)
     }
 }
 static void pause_us(unsigned us) { ticks += us; }
+static bool unsafe_probe(void *cookie) { assert(cookie==regs); return false; }
 static void reset(void)
 {
     memset(regs, 0, sizeof(regs)); writes = ticks = scenario = 0;
@@ -36,7 +37,7 @@ static void reset(void)
 }
 int main(void)
 {
-    struct sweet_gpu_power_io io = {regs, read_reg, write_reg, pause_us};
+    struct sweet_gpu_power_io io = {regs, read_reg, write_reg, pause_us, NULL};
     struct sweet_gpu_power_result r;
     reset();
     assert(sweet_gpu_cx_cycle(&io,256,320,0,&r) == SGC_OK);
@@ -68,5 +69,8 @@ int main(void)
     assert(sweet_gpu_cx_cycle(&io,256,320,0,&r) == SGC_IO && r.restored);
     reset(); scenario=4;
     assert(sweet_gpu_cx_cycle(&io,256,320,0,&r) == SGC_RESTORE && !r.restored);
+    reset(); io.powered_probe=unsafe_probe;
+    assert(sweet_gpu_cx_cycle(&io,256,320,0,&r)==SGC_PROBE_UNSAFE && !r.restored && r.probe_called);
+    assert(writes==2 && (regs[SGC_HW/4]&SGC_ON) && !(regs[SGC_CTRL/4]&SGC_COLLAPSE));
     puts("GPU CX cycle tests PASS");
 }

@@ -1,0 +1,313 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -14,6 +14,8 @@
+  * It programs an empty TCS, but sends no rail votes.
+  * sweetgpu=4 cycles only the CX domain with inherited adequate ARC levels,
+  * then restores its controls; no rail/clock/GMU/GX writes or firmware execution.
++ * sweetgpu=5 additionally cycles the GMU root clock with both child branches
++ * gated, leaving CX powered if clock restoration cannot be proven.
+  * Default off; leave the working display path untouched.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -47,18 +49,23 @@
+ }
+ 
+ #include "sweet_gpu_power.h"
++#include "sweet_gpu_clock.h"
++
++struct sweet_gpu_test_context { vm_offset_t cc, gcc; };
+ 
+ static uint32_t
+ sweet_gpu_power_read(void *cookie, unsigned offset)
+ {
+-	return sweet_gpu_read((vm_offset_t)cookie, offset);
++	struct sweet_gpu_test_context *ctx = cookie;
++	return sweet_gpu_read(ctx->cc, offset);
+ }
+ 
+ static void
+ sweet_gpu_power_write(void *cookie, unsigned offset, uint32_t value)
+ {
++	struct sweet_gpu_test_context *ctx = cookie;
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)((vm_offset_t)cookie + offset) = value;
++	*(volatile uint32_t *)(ctx->cc + offset) = value;
+ 	__asm__ volatile("dsb osh" ::: "memory");
+ }
+ 
+@@ -68,8 +75,45 @@
+ 	delay(us);
+ }
+ 
+-static void
+-sweet_gpu_cx_test(void)
++static uint32_t
++sweet_gpu_clock_read(void *cookie, bool gcc, unsigned offset)
++{
++	struct sweet_gpu_test_context *ctx = cookie;
++	return sweet_gpu_read(gcc ? ctx->gcc : ctx->cc, offset);
++}
++
++static void
++sweet_gpu_clock_write(void *cookie, bool gcc, unsigned offset, uint32_t value)
++{
++	struct sweet_gpu_test_context *ctx = cookie;
++	vm_offset_t base = gcc ? ctx->gcc : ctx->cc;
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + offset) = value;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static bool
++sweet_gpu_root_test(void *cookie)
++{
++	struct sweet_gpu_clock_io io = { cookie, sweet_gpu_clock_read,
++	    sweet_gpu_clock_write, sweet_gpu_power_delay };
++	struct sweet_gpu_clock_result r;
++	int result = sweet_gpu_gmu_root_cycle(&io, &r);
++	printf("SWEET GPU: GMU root cycle result=%d changed=%d running=%d safe-collapse=%d; nominal target 200MHz, branches stay disabled\n",
++	    result, r.changed, r.running, r.safe_to_collapse);
++	printf("SWEET GPU: GPLL0 mode=%#x L=%#x frac=%#x user=%#x op=%#x; no PLL writes\n",
++	    r.pll_mode, r.pll_l, r.pll_frac, r.pll_user, r.pll_opmode);
++	printf("SWEET GPU: root before cmd=%#x cfg=%#x gate=%#x CXbranch=%#x GXbranch=%#x; running cmd=%#x cfg=%#x; after cmd=%#x cfg=%#x gate=%#x\n",
++	    r.cmd_before, r.cfg_before, r.gate_before, r.cx_before, r.gx_before,
++	    r.cmd_running, r.cfg_running, r.cmd_after, r.cfg_after, r.gate_after);
++	if (!r.safe_to_collapse) {
++		printf("SWEET GPU: uncertain clock rollback; retain CX/parent power, no further GPU operations\n");
++	}
++	return r.safe_to_collapse;
++}
++
++static void
++sweet_gpu_cx_test(int mode)
+ {
+ 	unsigned cx = 0, mx = 0, gfx = 0;
+ 	if (sweet_rpmh_gpu_arc_level("cx.lvl", &cx) ||
+@@ -85,8 +129,9 @@
+ 	}
+ 	vm_offset_t cc = ml_io_map(GPU_CC_PA, GPU_CC_SIZE);
+ 	if (!cc) { return; }
+-	struct sweet_gpu_power_io io = { (void *)cc, sweet_gpu_power_read,
+-	    sweet_gpu_power_write, sweet_gpu_power_delay };
++	struct sweet_gpu_test_context ctx = { cc, gcc };
++	struct sweet_gpu_power_io io = { &ctx, sweet_gpu_power_read,
++	    sweet_gpu_power_write, sweet_gpu_power_delay, mode == 5 ? sweet_gpu_root_test : NULL };
+ 	struct sweet_gpu_power_result r;
+ 	int result = sweet_gpu_cx_cycle(&io, cx, mx, gfx, &r);
+ 	printf("SWEET GPU: CX cycle levels cx=%u mx=%u gfx=%u result=%d requested=%d restored=%d\n",
+@@ -108,8 +153,8 @@
+ 	clock_interval_to_deadline(90000, NSEC_PER_MSEC, &deadline);
+ 	assert_wait_deadline((event_t)&sweet_gpu_arc_thread, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
+-	if (mode == 4) {
+-		sweet_gpu_cx_test();
++	if (mode == 4 || mode == 5) {
++		sweet_gpu_cx_test(mode);
+ 		goto done;
+ 	}
+ 	const char *resources[] = { "cx.lvl", "mx.lvl", "gfx.lvl" };
+@@ -129,7 +174,7 @@
+ {
+ 	int mode = 0;
+ 	(void)PE_parse_boot_argn("sweetgpu", &mode, sizeof(mode));
+-	if (mode != 1 && mode != 2 && mode != 3 && mode != 4) {
++	if (mode != 1 && mode != 2 && mode != 3 && mode != 4 && mode != 5) {
+ 		return;
+ 	}
+ 	sweet_gpu_fw_probe();
+@@ -168,7 +213,7 @@
+ 	printf("SWEET GPU: GPUCC AHB_CBCR=%#x CX_GMU_CBCR=%#x\n",
+ 	    sweet_gpu_read(cc, 0x1078), sweet_gpu_read(cc, 0x1098));
+ 	printf("SWEET GPU: power/clock observations only; no rendering commands submitted\n");
+-	if (mode == 3 || mode == 4) {
++	if (mode == 3 || mode == 4 || mode == 5) {
+ 		thread_t thread;
+ 		kern_return_t kr = kernel_thread_start(sweet_gpu_arc_thread, (void *)(uintptr_t)mode, &thread);
+ 		if (kr == KERN_SUCCESS) {
+--- a/bsd/dev/sweet_gpu_power.h
++++ b/bsd/dev/sweet_gpu_power.h
+@@ -20,14 +20,15 @@
+ 	uint32_t (*read)(void *, unsigned);
+ 	void (*write)(void *, unsigned, uint32_t);
+ 	void (*delay)(unsigned);
++	bool (*powered_probe)(void *); /* false: keep CX on for uncertain rollback */
+ };
+ struct sweet_gpu_power_result {
+ 	uint32_t before, hw_before, gx_before, ahb_before, gmu_before;
+ 	uint32_t powered, hw_powered, ahb_powered;
+ 	uint32_t after, hw_after, gx_after, gmu_after;
+-	bool requested, restored;
++	bool requested, restored, probe_called;
+ };
+-enum { SGC_OK, SGC_GUARD, SGC_IO, SGC_TIMEOUT, SGC_RESTORE };
++enum { SGC_OK, SGC_GUARD, SGC_IO, SGC_TIMEOUT, SGC_RESTORE, SGC_PROBE_UNSAFE };
+ static inline bool
+ sgc_write_check(const struct sweet_gpu_power_io *io, uint32_t value)
+ {
+@@ -78,6 +79,16 @@
+ 		if (out->powered == 0xffffffffu || out->hw_powered == 0xffffffffu ||
+ 		    out->ahb_powered == 0xffffffffu || !(out->hw_powered & SGC_ON)) { result = SGC_IO; }
+ 	}
++	if (result == SGC_OK && io->powered_probe) {
++		out->probe_called = true;
++		if (!io->powered_probe(io->cookie)) {
++			out->after = io->read(io->cookie, SGC_CTRL);
++			out->hw_after = io->read(io->cookie, SGC_HW);
++			out->gx_after = io->read(io->cookie, SGC_GX);
++			out->gmu_after = io->read(io->cookie, SGC_GMU);
++			return SGC_PROBE_UNSAFE;
++		}
++	}
+ restore:
+ 	/* Re-collapse with the eight-cycle setting before restoring the old wait.
+ 	 * CX DT deliberately skips OFF status polling (AOP may hold it on).
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_clock.h
+@@ -0,0 +1,147 @@
++/* SM7150 GMU root-only clock cycle. Caller has powered CX with adequate rails.
++ * No PLL retuning or GMU/GX branch enable. Source: Xiaomi 758bb7ef GPUCC/GCC,
++ * clk-rcg2.c, clk-alpha-pll.c and clk-branch.c. Values are register encodings.
++ */
++#ifndef SWEET_GPU_CLOCK_H
++#define SWEET_GPU_CLOCK_H
++#include <stdint.h>
++#include <stdbool.h>
++#define SGR_CMD 0x1120u
++#define SGR_CFG 0x1124u
++#define SGR_CX 0x1098u
++#define SGR_GX 0x1064u
++#define SGR_GATE 0x52004u
++#define SGR_GATE_BIT (1u << 16)
++#define SGR_OFF (1u << 31)
++#define SGR_UPDATE 1u
++#define SGR_FORCE 2u
++#define SGR_CFG_MASK 0x10371fu
++struct sweet_gpu_clock_io {
++	void *cookie;
++	uint32_t (*read)(void *, bool, unsigned); /* true: GCC, false: GPUCC */
++	void (*write)(void *, bool, unsigned, uint32_t);
++	void (*delay)(unsigned);
++};
++struct sweet_gpu_clock_result {
++	uint32_t pll_mode, pll_l, pll_frac, pll_user, pll_opmode;
++	uint32_t cmd_before, cfg_before, gate_before, cx_before, gx_before;
++	uint32_t cmd_running, cfg_running, cmd_after, cfg_after, gate_after;
++	bool changed, running, safe_to_collapse;
++};
++enum { SGR_OK, SGR_GUARD, SGR_IO, SGR_TIMEOUT, SGR_RESTORE };
++static inline bool
++sgr_poll(const struct sweet_gpu_clock_io *io, unsigned offset, uint32_t mask, uint32_t expect)
++{
++	for (unsigned us = 0; us < 500; us++) {
++		uint32_t v = io->read(io->cookie, false, offset);
++		if (v == 0xffffffffu) { return false; }
++		if ((v & mask) == expect) { return true; }
++		io->delay(1);
++	}
++	return false;
++}
++static inline bool
++sgr_configure(const struct sweet_gpu_clock_io *io, uint32_t cfg)
++{
++	uint32_t cmd = io->read(io->cookie, false, SGR_CMD);
++	if (cmd == 0xffffffffu || (cmd & (SGR_UPDATE | SGR_FORCE))) { return false; }
++	io->write(io->cookie, false, SGR_CFG, cfg);
++	if (io->read(io->cookie, false, SGR_CFG) != cfg) { return false; }
++	io->write(io->cookie, false, SGR_CMD, cmd | SGR_UPDATE);
++	return sgr_poll(io, SGR_CMD, SGR_UPDATE, 0);
++}
++static inline bool
++sgr_parent_bit(const struct sweet_gpu_clock_io *io, uint32_t bit)
++{
++	uint32_t v = io->read(io->cookie, true, SGR_GATE);
++	if (v == 0xffffffffu) { return false; }
++	io->write(io->cookie, true, SGR_GATE, (v & ~SGR_GATE_BIT) | bit);
++	v = io->read(io->cookie, true, SGR_GATE);
++	io->delay(10); /* BRANCH_HALT_DELAY, no independent halt register. */
++	return v != 0xffffffffu && (v & SGR_GATE_BIT) == bit;
++}
++static inline int
++sweet_gpu_gmu_root_cycle(const struct sweet_gpu_clock_io *io, struct sweet_gpu_clock_result *r)
++{
++	*r = (struct sweet_gpu_clock_result){0};
++	r->safe_to_collapse = true;
++	r->pll_mode = io->read(io->cookie, true, 0x0);
++	r->pll_l = io->read(io->cookie, true, 0x4);
++	r->pll_frac = io->read(io->cookie, true, 0x38);
++	r->pll_user = io->read(io->cookie, true, 0xc);
++	r->pll_opmode = io->read(io->cookie, true, 0x2c);
++	r->cmd_before = io->read(io->cookie, false, SGR_CMD);
++	r->cfg_before = io->read(io->cookie, false, SGR_CFG);
++	r->gate_before = io->read(io->cookie, true, SGR_GATE);
++	r->cx_before = io->read(io->cookie, false, SGR_CX);
++	r->gx_before = io->read(io->cookie, false, SGR_GX);
++	unsigned parent = (r->cfg_before >> 8) & 7u;
++	/* Fixed GPLL0: 19.2MHz*(31 + 0x4000/65536) = 600MHz. Div2 =>300MHz.
++	 * Both consumers must stay gated. Only restore known XO or GPLL0/div2.
++	 */
++	if (r->pll_mode == 0xffffffffu || r->pll_user == 0xffffffffu ||
++	    (r->pll_mode & (SGR_OFF | 5u)) != (SGR_OFF | 5u) ||
++	    r->pll_l != 31 || r->pll_frac != 0x4000 || r->pll_opmode != 1 ||
++	    !(r->pll_user & 1u) || r->gate_before == 0xffffffffu ||
++	    r->cmd_before == 0xffffffffu ||
++	    (r->cmd_before & (SGR_OFF | 0xf3u)) != SGR_OFF ||
++	    r->cfg_before == 0xffffffffu || (r->cfg_before & 0x103000u) ||
++	    (parent != 0 && parent != 6) || r->cx_before == 0xffffffffu ||
++	    r->gx_before == 0xffffffffu ||
++	    (r->cx_before & (SGR_OFF | 1u)) != SGR_OFF ||
++	    (r->gx_before & (SGR_OFF | 1u)) != SGR_OFF) { return SGR_GUARD; }
++	r->changed = true;
++	r->safe_to_collapse = false;
++	int result = SGR_IO;
++	if (!sgr_parent_bit(io, SGR_GATE_BIT)) { goto restore; }
++	/* Parent select6, HID2 =>300MHz/(1.5)=200MHz, no M/N or HW clock mode. */
++	if (!sgr_configure(io, (r->cfg_before & ~SGR_CFG_MASK) | 0x602u)) {
++		result = SGR_TIMEOUT;
++		goto restore;
++	}
++	uint32_t cmd = io->read(io->cookie, false, SGR_CMD);
++	if (cmd == 0xffffffffu) { goto restore; }
++	io->write(io->cookie, false, SGR_CMD, cmd | SGR_FORCE);
++	if (!sgr_poll(io, SGR_CMD, SGR_OFF | SGR_FORCE, SGR_FORCE)) {
++		result = SGR_TIMEOUT;
++		goto restore;
++	}
++	r->cmd_running = io->read(io->cookie, false, SGR_CMD);
++	r->cfg_running = io->read(io->cookie, false, SGR_CFG);
++	r->running = true;
++	result = SGR_OK;
++	uint32_t pll_now = io->read(io->cookie, true, 0x0);
++	if (r->cmd_running == 0xffffffffu ||
++	    r->cfg_running != ((r->cfg_before & ~SGR_CFG_MASK) | 0x602u) ||
++	    pll_now == 0xffffffffu) { result = SGR_IO; }
++	if (io->read(io->cookie, true, 0x4) != r->pll_l ||
++	    io->read(io->cookie, true, 0x38) != r->pll_frac ||
++	    (pll_now & (SGR_OFF | 5u)) != (SGR_OFF | 5u)) { result = SGR_IO; }
++	if (io->read(io->cookie, false, SGR_CX) != r->cx_before ||
++	    io->read(io->cookie, false, SGR_GX) != r->gx_before) { result = SGR_IO; }
++restore:
++	/* Never force-clear UPDATE or drop a parent while a configuration is
++	 * uncertain. On incomplete rollback leave CX and its parent powered.
++	 */
++	cmd = io->read(io->cookie, false, SGR_CMD);
++	if (cmd == 0xffffffffu || (cmd & SGR_UPDATE)) { return SGR_RESTORE; }
++	io->write(io->cookie, false, SGR_CMD, cmd & ~SGR_FORCE);
++	if (!sgr_poll(io, SGR_CMD, SGR_OFF | SGR_FORCE, SGR_OFF) ||
++	    !sgr_configure(io, r->cfg_before) ||
++	    !sgr_poll(io, SGR_CMD, SGR_OFF | SGR_FORCE | SGR_UPDATE, SGR_OFF)) {
++		return SGR_RESTORE;
++	}
++	if (!sgr_parent_bit(io, r->gate_before & SGR_GATE_BIT)) { return SGR_RESTORE; }
++	r->cmd_after = io->read(io->cookie, false, SGR_CMD);
++	r->cfg_after = io->read(io->cookie, false, SGR_CFG);
++	r->gate_after = io->read(io->cookie, true, SGR_GATE);
++	r->safe_to_collapse = r->cfg_after == r->cfg_before &&
++	    r->cmd_after != 0xffffffffu &&
++	    (r->cmd_after & (SGR_OFF | SGR_FORCE | SGR_UPDATE)) == SGR_OFF &&
++	    r->gate_after != 0xffffffffu &&
++	    (r->gate_after & SGR_GATE_BIT) == (r->gate_before & SGR_GATE_BIT) &&
++	    io->read(io->cookie, false, SGR_CX) == r->cx_before &&
++	    io->read(io->cookie, false, SGR_GX) == r->gx_before;
++	return r->safe_to_collapse ? result : SGR_RESTORE;
++}
++#endif
