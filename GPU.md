@@ -101,6 +101,17 @@ The SQE file keeps its initial header word; a future GPU loader must skip it.
 Checksums detect corruption, not vendor authentication. ELF load addresses
 must never be used directly as host physical RAM addresses.
 
+## ARC read semantics reference
+
+Qualcomm's October 2025 upstream discussion clarifies that an RPMh read returns
+the HLOS/DRV2 vote for ARC/BCM/VRM, not the aggregate across hardware voters:
+[developer discussion](https://lkml.iu.edu/2510.3/03634.html).
+This explains why obtaining a fresh read is useful before changing an inherited
+bootloader vote. On this board, validate each returned value against its command
+DB table before treating it as a saved index. Do not reduce an inherited vote
+merely because the GPU requires a lower level; preserve other users of the rail.
+The current probe still reports raw responses and makes no power request.
+
 ## Recovery reference for power bring-up
 
 The live command DB has these raw level tables (zeros after the listed values
