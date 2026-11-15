@@ -1,0 +1,338 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -10,15 +10,22 @@
+  * the GPU clock controller if its GCC configuration bus is clocked.
+  * Neither mode accesses GPU/GMU/SMMU core registers, changes a clock or
+  * regulator, uploads firmware, allocates DMA, or advertises acceleration.
++ * sweetgpu=3 additionally schedules delayed RPMh ARC READ transactions.
++ * It programs an empty TCS, but sends no rail votes.
+  * Default off; leave the working display path untouched.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <pexpert/pexpert.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_gpu_probe(void);
++extern kern_return_t thread_terminate(thread_t);
++extern int sweet_rpmh_gpu_arc_read(const char *res);
+ 
+ #define GPU_GCC_PA       0x00100000u
+ #define GPU_GCC_SIZE     0x00090000u
+@@ -34,12 +41,33 @@
+ 	return value;
+ }
+ 
++static void
++sweet_gpu_arc_thread(void *argument, wait_result_t wait_result)
++{
++	(void)argument;
++	(void)wait_result;
++	uint64_t deadline;
++	printf("SWEET GPU: ARC reads scheduled after 90 s; touch power has priority\n");
++	clock_interval_to_deadline(90000, NSEC_PER_MSEC, &deadline);
++	assert_wait_deadline((event_t)&sweet_gpu_arc_thread, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++	const char *resources[] = { "cx.lvl", "mx.lvl", "gfx.lvl" };
++	printf("SWEET GPU: RPMh ARC discovery; TCS read requests only, no power votes\n");
++	for (unsigned i = 0; i < 3; i++) {
++		if (sweet_rpmh_gpu_arc_read(resources[i]) != 0) {
++			break;
++		}
++	}
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
+ void
+ sweet_gpu_probe(void)
+ {
+ 	int mode = 0;
+ 	(void)PE_parse_boot_argn("sweetgpu", &mode, sizeof(mode));
+-	if (mode != 1 && mode != 2) {
++	if (mode != 1 && mode != 2 && mode != 3) {
+ 		return;
+ 	}
+ 	vm_offset_t gcc = ml_io_map(GPU_GCC_PA, GPU_GCC_SIZE);
+@@ -77,5 +105,14 @@
+ 	printf("SWEET GPU: GPUCC AHB_CBCR=%#x CX_GMU_CBCR=%#x\n",
+ 	    sweet_gpu_read(cc, 0x1078), sweet_gpu_read(cc, 0x1098));
+ 	printf("SWEET GPU: power/clock observations only; no rendering commands submitted\n");
++	if (mode == 3) {
++		thread_t thread;
++		kern_return_t kr = kernel_thread_start(sweet_gpu_arc_thread, NULL, &thread);
++		if (kr == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		} else {
++			printf("SWEET GPU: ARC thread creation failed %d\n", kr);
++		}
++	}
+ }
+ #endif
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -51,6 +51,7 @@
+ static unsigned rh_ncpt;
+ static unsigned rh_lock;
+ static bool rh_poisoned;
++static bool rh_touch_ready;
+ 
+ static uint32_t
+ rh_read(vm_offset_t base, uint32_t off)
+@@ -347,6 +348,9 @@
+ 	}
+ 	if (!error) {
+ 		error = rh_send(address, mv);
++		if (!error) {
++			rh_touch_ready = true;
++		}
+ 	}
+ out:
+ 	if (error) {
+@@ -355,4 +359,5 @@
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++#include "sweet_rpmh_arc.inc"
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- /dev/null
++++ b/bsd/dev/sweet_arc.h
+@@ -0,0 +1,42 @@
++/* SWEET ARC command-DB policy. Values are abstract levels, NOT millivolts.
++ * AUX data contains little-endian u16 levels without Linux's consumer +1.
++ * Caller provides uint16_t and unsigned types. Kept host-testable.
++ */
++#ifndef SWEET_ARC_H
++#define SWEET_ARC_H
++#define SWEET_ARC_LEVELS 16u
++
++static inline int
++sweet_arc_level_count(const uint16_t *levels, unsigned count)
++{
++	unsigned used = count;
++	if (!levels || count == 0 || count > SWEET_ARC_LEVELS || levels[0] != 0) {
++		return -1;
++	}
++	for (unsigned i = 1; i < count; i++) {
++		if (levels[i] == 0) {
++			if (used == count) {
++				used = i;
++			}
++		} else if (used != count || levels[i] <= levels[i - 1]) {
++			return -1;
++		}
++	}
++	return used > 1 ? (int)used : -1;
++}
++
++static inline int
++sweet_arc_level_index(const uint16_t *levels, unsigned count, unsigned level)
++{
++	int used = sweet_arc_level_count(levels, count);
++	if (used < 0) {
++		return -1;
++	}
++	for (unsigned i = 0; i < (unsigned)used; i++) {
++		if (levels[i] >= level) {
++			return (int)i;
++		}
++	}
++	return -1;
++}
++#endif
+--- /dev/null
++++ b/bsd/dev/sweet_rpmh_arc.inc
+@@ -0,0 +1,189 @@
++/* GPU ARC discovery uses the same lock and timeout quarantine as the LDO.
++ * Source: Xiaomi 758bb7ef, qcom-rpmh-mailbox.c and rpmh-regulator.c.
++ * Read requests program an empty ACTIVE TCS, but send no resource writes.
++ */
++#include "sweet_arc.h"
++int sweet_rpmh_gpu_arc_read(const char *res);
++
++static int
++rh_arc_lookup(const char *res, uint32_t *address, uint16_t *levels, unsigned *nlevels)
++{
++	uint32_t key[2] = {0, 0};
++	unsigned matches = 0;
++	for (unsigned i = 0; i < 8 && res[i]; i++) {
++		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
++	}
++	for (unsigned i = 0; i < 8; i++) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h), count = rh_db16(h + 6);
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		uint32_t aux = RH_DB_HEADER + rh_db16(h + 4);
++		if (!slave) {
++			break;
++		}
++		if (slave < 3 || slave > 5 || (entries & 3u) ||
++		    !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(aux, 0)) {
++			return EINVAL;
++		}
++		for (unsigned j = 0; j < count; j++) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			if (rh_read(rh_db, e) != key[0] || rh_read(rh_db, e + 4) != key[1]) {
++				continue;
++			}
++			uint32_t addr = rh_read(rh_db, e + 16);
++			unsigned len = rh_db16(e + 20);
++			uint32_t off = aux + rh_db16(e + 22);
++			if (slave != 3 || (addr >> 16) != 3 || (addr & 15u) ||
++			    !len || len > 2 * SWEET_ARC_LEVELS || (len & 1u) ||
++			    (off & 1u) || !rh_range(off, len)) {
++				return EINVAL;
++			}
++			for (unsigned k = 0; k < len / 2; k++) {
++				levels[k] = rh_db16(off + 2 * k);
++			}
++			int used = sweet_arc_level_count(levels, len / 2);
++			if (used < 0) {
++				return EINVAL;
++			}
++			*address = addr;
++			*nlevels = (unsigned)used;
++			matches++;
++		}
++	}
++	return matches == 1 ? 0 : ENODEV;
++}
++
++static int
++rh_arc_read(uint32_t address, uint32_t *response)
++{
++	int chosen = -1;
++	for (unsigned t = 0; t < RH_ACTIVE_N; t++) {
++		uint32_t b = t * RH_TCS_STRIDE;
++		uint32_t enabled = rh_read(rh_tcs, b + RH_ENABLE);
++		if (enabled & ~((1u << rh_ncpt) - 1u)) {
++			return EIO;
++		}
++		for (unsigned c = 0; c < rh_ncpt; c++) {
++			if ((enabled & (1u << c)) &&
++			    rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) == address) {
++				return EBUSY;
++			}
++		}
++		if (chosen < 0 && rh_free(t)) {
++			chosen = (int)t;
++		}
++	}
++	if (chosen < 0) {
++		return EBUSY;
++	}
++	unsigned t = (unsigned)chosen;
++	uint32_t b = t * RH_TCS_STRIDE, bit = 1u << t;
++	uint32_t irq_en = rh_read(rh_tcs, RH_IRQ_EN);
++	if (irq_en == 0xffffffffu || !rh_free(t)) {
++		return EBUSY;
++	}
++	if (!rh_sync(RH_IRQ_EN, irq_en & ~bit)) {
++		rh_poisoned = true;
++		return EIO;
++	}
++	if (!rh_free(t)) {
++		if (!rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | (irq_en & bit))) {
++			rh_poisoned = true;
++		}
++		return EBUSY;
++	}
++	/* From this point a failed transaction quarantines its slot for this boot.
++	 * An ACK is mandatory. In particular, WRITE bit 16 is intentionally clear.
++	 */
++	rh_poisoned = true;
++	if (!rh_sync(b + RH_MSGID, 8u | (1u << 8)) ||
++	    !rh_sync(b + RH_ADDR, address) || !rh_sync(b + RH_DATA, 0) ||
++	    !rh_sync(b + RH_WAIT, 1) || !rh_sync(b + RH_ENABLE, 1) ||
++	    !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
++		return EIO;
++	}
++	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
++	bool done = false;
++	uint32_t irq = 0, idle = 0, status = 0;
++	for (unsigned us = 0; us < RH_TIMEOUT_US; us++) {
++		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
++		idle = rh_read(rh_tcs, b + RH_STATUS);
++		status = rh_read(rh_tcs, b + RH_CMD_STATUS);
++		/* Require a fresh IRQ: CMD_STATUS and response can survive old requests. */
++		if (irq != 0xffffffffu && (irq & bit) && idle && idle != 0xffffffffu &&
++		    status != 0xffffffffu &&
++		    (status & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE)) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	printf("SWEET RPMH: ARC read TCS%u addr=%#x done=%d irq=%#x idle=%#x status=%#x\n",
++	    t, address, done, irq, idle, status);
++	if (!done) {
++		printf("SWEET RPMH: ARC timeout; slot quarantined, no retry or power writes\n");
++		return ETIMEDOUT;
++	}
++	/* Downstream RSC_DRV_CMD_RESP_DATA, not the request DATA register. */
++	uint32_t value = rh_read(rh_tcs, b + 0x40);
++	if (!rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, 0) ||
++	    !rh_sync(b + RH_ENABLE, 0) || !rh_sync(b + RH_WAIT, 0)) {
++		return EIO;
++	}
++	rh_write(rh_tcs, RH_IRQ_CLEAR, bit);
++	if ((rh_read(rh_tcs, RH_IRQ_STATUS) & bit) ||
++	    !rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | (irq_en & bit))) {
++		return EIO;
++	}
++	rh_poisoned = false;
++	*response = value;
++	return 0;
++}
++
++int
++sweet_rpmh_gpu_arc_read(const char *res)
++{
++	if (!res || (strcmp(res, "cx.lvl") && strcmp(res, "mx.lvl") && strcmp(res, "gfx.lvl"))) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0, response = 0;
++	uint16_t levels[SWEET_ARC_LEVELS] = {0};
++	unsigned count = 0;
++	if (rh_poisoned) {
++		goto out;
++	}
++	if (!rh_touch_ready) {
++		error = EAGAIN;
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_arc_lookup(res, &address, levels, &count);
++	}
++	if (!error) {
++		printf("SWEET GPU: ARC %s addr=%#x levels(raw):", res, address);
++		for (unsigned i = 0; i < count; i++) {
++			printf(" %u:%u", i, levels[i]);
++		}
++		printf("; LOW_SVS index=%d\n", sweet_arc_level_index(levels, count, 64));
++		error = rh_arc_read(address, &response);
++	}
++	if (!error) {
++		/* Keep this raw until ARC read semantics are verified on the board.
++		 * Do not use it as an inherited vote to restore or lower a shared rail.
++		 */
++		printf("SWEET GPU: ARC %s read-response=%#x (not a voltage or saved HLOS vote)\n",
++		    res, response);
++	}
++out:
++	if (error) {
++		printf("SWEET GPU: ARC %s discovery failed errno=%d; no rail writes\n", res, error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
