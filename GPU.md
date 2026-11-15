@@ -175,6 +175,23 @@ The full permanent boot partition SHA256 remains
 Normal boot was requested at 19:58:16 CET and the user confirmed the phone
 returned to Home. The probes were temporary only.
 
+## First display integration target
+
+`iokit/Kernel/arm/SweetFramebuffer.cpp`, `AppleCLCD::present`, currently looks up
+retained `SweetSurface` instances and copies each clipped four-byte-pixel layer
+row into the panel framebuffer with CPU `memcpy`. This is a concrete future
+integration point for a GPU copy after command submission works, without first
+advertising a Metal device. It is not implemented by the diagnostic patches.
+
+An initial GPU-copy path must pin source/destination memory descriptors, map
+physical segments into the GPU SMMU (CPU virtual addresses are not GPU addresses),
+retain surfaces until a completion fence, handle cache visibility, and preserve
+clipping/stride/bounds behavior. Any fallback after an uncertain submission must
+first stop GPU writes before the CPU touches the destination. Test a private
+scratch copy with a CPU comparison before allowing writes to scanout memory.
+Copy offload alone does not accelerate application rendering; measure its actual
+benefit rather than equating a successful DMA copy with fluent iOS graphics.
+
 ## Work still needed for rendering
 
 First establish power/clock state, then implement the required power votes,
