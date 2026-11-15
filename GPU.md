@@ -28,8 +28,9 @@ GIC is only read. On success restore the original source-enable bit; on any
 uncertain transaction mask that source and quarantine the slot. Tests model
 IRQ_ENABLE gating and verify both initially enabled/disabled source restoration,
 GIC rejection, missing mappings and stale status. The first mode-3 device test
-reached Home/touch but timed out with IRQ_ENABLE masked; validation of the fix
-on hardware is pending. Register offsets follow Linux's
+reached Home/touch but timed out with IRQ_ENABLE masked. The corrected test
+reached Home/touch and completed all three reads with a fresh IRQ. A second boot
+with firmware validation repeated the same successful reads. Register offsets follow Linux's
 [ARM GIC definitions](https://github.com/torvalds/linux/blob/master/include/linux/irqchip/arm-gic.h)
 and the board's live DT.
 
@@ -44,7 +45,8 @@ live CX DT has no clock/reset/bus references beyond its parent supply and hardwa
 status register. No RPMh vote, clock, GX, core or GMU register write occurs.
 Control restoration is checked; it is not claimed to prove physical OFF because
 the board explicitly specifies no OFF-status poll. Host tests exercise guards,
-success, timeout, readback failures and restoration failures. Hardware test pending.
+success, timeout, readback failures and restoration failures. Full CI build
+passed; temporary mode-4 hardware test is in progress.
 
 The live DT links GPUCC CX/MX/GFX to those three ARC resources. CX's parent
 relationship includes MX; the existing `ldoc11` helper only implements a PMIC
@@ -104,8 +106,8 @@ entry, SHA256 digest and firmware format, and reports lengths. It publishes no
 accelerator, performs no upload and interprets no ELF address as a CPU physical
 address. Default-off, independent from the RPMh mode. Host tests compare the
 exact C parser with the packer across truncations, byte mutations, overflowing
-lengths and malformed inner images with recomputed hashes. Hardware verification
-is pending; checksum validation is not firmware authentication.
+lengths and malformed inner images with recomputed hashes. The kernel reader has now validated all three private firmware files on the
+phone, with Home/touch working. Checksum validation is not authentication.
 
 Bundle layout: 32-byte `<8sII16s>` header (magic, version 1, count 3, zero reserved
 bytes), then three 56-byte `<IIQQ32s>` records (kind, zero flags, offset, length,
