@@ -38,9 +38,16 @@ static void reset(void)
     cc[SGR_CMD/4]=SGR_OFF;cc[SGR_CFG/4]=1;
     cc[SGR_CX/4]=0x80004220;cc[SGR_GX/4]=SGR_OFF;
 }
+static unsigned probe_calls;
+static bool probe_ok(void *cookie)
+{
+    assert(cookie==cc && (cc[SGR_CMD/4] & (SGR_OFF|3))==2);
+    probe_calls++; return true;
+}
+static bool probe_unsafe(void *cookie) { probe_ok(cookie); return false; }
 int main(void)
 {
-    struct sweet_gpu_clock_io io={cc,rd,wr,pause_us};struct sweet_gpu_clock_result r;
+    struct sweet_gpu_clock_io io={cc,rd,wr,pause_us,NULL};struct sweet_gpu_clock_result r;
     reset();assert(sweet_gpu_gmu_root_cycle(&io,&r)==SGR_OK);
     assert(r.running && r.changed && r.safe_to_collapse && r.cfg_running==0x602);
     assert(r.cmd_running==SGR_FORCE && r.cmd_after==SGR_OFF && r.cfg_after==1);
@@ -77,5 +84,12 @@ int main(void)
     reset();scenario=4;assert(sweet_gpu_gmu_root_cycle(&io,&r)==SGR_RESTORE && !r.safe_to_collapse);
     assert(gcc[SGR_GATE/4]&SGR_GATE_BIT);
     reset();scenario=5;assert(sweet_gpu_gmu_root_cycle(&io,&r)==SGR_RESTORE && !r.safe_to_collapse);
+    reset();probe_calls=0;io.running_probe=probe_ok;
+    assert(sweet_gpu_gmu_root_cycle(&io,&r)==SGR_OK && r.probe_called && probe_calls==1 && r.safe_to_collapse);
+    reset();probe_calls=0;scenario=2;
+    assert(sweet_gpu_gmu_root_cycle(&io,&r)==SGR_TIMEOUT && !r.probe_called && probe_calls==0);
+    reset();probe_calls=0;io.running_probe=probe_unsafe;
+    assert(sweet_gpu_gmu_root_cycle(&io,&r)==SGR_PROBE_UNSAFE && r.probe_called && probe_calls==1);
+    assert(!r.safe_to_collapse && writes==4 && cc[SGR_CMD/4]==SGR_FORCE && (gcc[SGR_GATE/4]&SGR_GATE_BIT));
     puts("GPU root clock tests PASS");
 }

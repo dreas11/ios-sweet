@@ -12,6 +12,7 @@ class GPUClockTests(unittest.TestCase):
             (d / 'bsd/dev').mkdir(parents=True)
             (d / 'bsd/dev/sweet_gpu_clock.h').write_text(added_file(patch, 'sweet_gpu_clock.h'))
             subprocess.run(['git','apply','--unsafe-paths',str(ROOT / 'xnu/patches/0088-sweet-gpu-fabia-fsm-status.patch')],cwd=d,check=True,capture_output=True)
+            subprocess.run(['git','apply','--include=bsd/dev/sweet_gpu_clock.h',str(ROOT / 'xnu/patches/0089-sweet-gpu-reset-held-gmu-clock.patch')],cwd=d,check=True,capture_output=True)
             binary = d / 'power'
             subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-I',str(d / 'bsd/dev'),
                             str(ROOT / 'tests/gpu_clock_test.c'),'-o',str(binary)],check=True,capture_output=True)

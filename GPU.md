@@ -83,6 +83,19 @@ kernel flags, not the kernel-cache-only LASTDATA_CONST rename/export filtering;
 segment permissions, constructor targets, symbols and payload were checked before
 boot. The permanent boot remains the original working image.
 
+Patch 0089 adds opt-in `sweetgpu=6`: within the verified CX/root cycle,
+check GMU GIC INTIDs336/337 are disabled/inactive, then inspect the AO AHB
+fence and CM3 SYSRESET through separate 16-KiB mappings. Only with the fence
+already allowing access, SYSRESET exactly1, and valid control/status reads,
+briefly enable the CX_GMU branch with the downstream wake/sleep settings.
+Require clock ON, recheck reset is still asserted, disable/poll OFF and restore
+its original register. No GMU register, reset, GX clock, firmware or DMA write
+is available through this probe's interface. An uncertain branch rollback keeps
+root/parent/CX powered; it must not be mistaken for successful cleanup. Host
+models cover forbidden access ordering, reset/fence guards, enable/disable and
+restoration failures, and root retention. Hardware access/branch verification is
+pending; MMIO accessibility still requires the temporary device test.
+
 The live DT links GPUCC CX/MX/GFX to those three ARC resources. CX's parent
 relationship includes MX; the existing `ldoc11` helper only implements a PMIC
 LDO protocol and must not be reused for ARC. Auxiliary ARC data maps indexes to

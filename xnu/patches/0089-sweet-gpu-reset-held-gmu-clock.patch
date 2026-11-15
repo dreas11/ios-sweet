@@ -1,0 +1,268 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1,5 +1,5 @@
+ /*
+- * SWEET / Adreno 618: opt-in, read-only power/clock discovery.
++ * SWEET / Adreno 618: opt-in power/clock bring-up.
+  *
+  * Register provenance: Xiaomi sweet-r-oss, revision
+  * 758bb7ef50af360e728662a1ed3b3a1b977a2f13:
+@@ -16,6 +16,8 @@
+  * then restores its controls; no rail/clock/GMU/GX writes or firmware execution.
+  * sweetgpu=5 additionally cycles the GMU root clock with both child branches
+  * gated, leaving CX powered if clock restoration cannot be proven.
++ * sweetgpu=6 additionally probes GMU registers and cycles CX_GMU only if
++ * CM3 is already held in reset; never writes a GMU register or runs firmware.
+  * Default off; leave the working display path untouched.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -50,8 +52,9 @@
+ 
+ #include "sweet_gpu_power.h"
+ #include "sweet_gpu_clock.h"
+-
+-struct sweet_gpu_test_context { vm_offset_t cc, gcc; };
++#include "sweet_gpu_gmu_branch.h"
++
++struct sweet_gpu_test_context { vm_offset_t cc, gcc, gmu, ao; int mode; };
+ 
+ static uint32_t
+ sweet_gpu_power_read(void *cookie, unsigned offset)
+@@ -92,14 +95,54 @@
+ 	__asm__ volatile("dsb osh" ::: "memory");
+ }
+ 
++static uint32_t
++sweet_gpu_gmu_read(void *cookie, bool ao, unsigned offset)
++{
++	struct sweet_gpu_test_context *ctx = cookie;
++	return sweet_gpu_read(ao ? ctx->ao : ctx->gmu, offset);
++}
++
++static bool
++sweet_gpu_gmu_test(void *cookie)
++{
++	struct sweet_gpu_test_context *ctx = cookie;
++	/* Live DT GMU SPI304/305 => GIC INTID336/337. Read-only guards. */
++	vm_offset_t gic = ml_io_map(0x17a00000u, 0x1000);
++	if (!gic) { printf("SWEET GPU: GMU probe skipped: GIC unavailable\n"); return true; }
++	uint32_t enabled = sweet_gpu_read(gic, 0x128);
++	uint32_t active = sweet_gpu_read(gic, 0x328);
++	if ((enabled | active) & 0x30000u) {
++		printf("SWEET GPU: GMU probe skipped: INTID336/337 enabled=%#x active=%#x\n", enabled, active);
++		return true;
++	}
++	ctx->gmu = ml_io_map(0x0507c000u, 0x4000);
++	ctx->ao = ml_io_map(0x0508c000u, 0x4000);
++	if (!ctx->gmu || !ctx->ao) {
++		printf("SWEET GPU: GMU probe skipped: register mapping failed\n"); return true;
++	}
++	printf("SWEET GPU: GMU fence/reset probe entering; no GMU register writes\n");
++	struct sweet_gpu_gmu_io io = { ctx, sweet_gpu_power_read,
++	    sweet_gpu_power_write, sweet_gpu_gmu_read, sweet_gpu_power_delay };
++	struct sweet_gpu_gmu_result r;
++	int result = sweet_gpu_gmu_branch_cycle(&io, &r);
++	printf("SWEET GPU: GMU branch result=%d registers=%d changed=%d running=%d restored=%d safe-root-stop=%d\n",
++	    result, r.registers_read, r.changed, r.clock_running, r.restored, r.safe_to_stop_root);
++	printf("SWEET GPU: GMU fence=%#x reset-before=%#x reset-after=%#x fw-result=%#x cm3-cfg=%#x; no reset release or firmware execution\n",
++	    r.fence, r.reset_before, r.reset_after, r.fw_result, r.cm3_cfg);
++	printf("SWEET GPU: GMU branch before=%#x running=%#x after=%#x; AHB=%#x CXhw=%#x root=%#x cfg=%#x\n",
++	    r.before, r.running, r.after, r.ahb, r.cx_hw, r.root_cmd, r.root_cfg);
++	return r.safe_to_stop_root;
++}
++
+ static bool
+ sweet_gpu_root_test(void *cookie)
+ {
++	struct sweet_gpu_test_context *ctx = cookie;
+ 	struct sweet_gpu_clock_io io = { cookie, sweet_gpu_clock_read,
+-	    sweet_gpu_clock_write, sweet_gpu_power_delay };
++	    sweet_gpu_clock_write, sweet_gpu_power_delay, ctx->mode == 6 ? sweet_gpu_gmu_test : NULL };
+ 	struct sweet_gpu_clock_result r;
+ 	int result = sweet_gpu_gmu_root_cycle(&io, &r);
+-	printf("SWEET GPU: GMU root cycle result=%d changed=%d running=%d safe-collapse=%d; nominal target 200MHz, branches stay disabled\n",
++	printf("SWEET GPU: GMU root cycle result=%d changed=%d running=%d safe-collapse=%d; nominal target 200MHz\n",
+ 	    result, r.changed, r.running, r.safe_to_collapse);
+ 	printf("SWEET GPU: GPLL0 mode=%#x L=%#x frac=%#x user=%#x op=%#x; no PLL writes\n",
+ 	    r.pll_mode, r.pll_l, r.pll_frac, r.pll_user, r.pll_opmode);
+@@ -129,9 +172,9 @@
+ 	}
+ 	vm_offset_t cc = ml_io_map(GPU_CC_PA, GPU_CC_SIZE);
+ 	if (!cc) { return; }
+-	struct sweet_gpu_test_context ctx = { cc, gcc };
++	struct sweet_gpu_test_context ctx = { cc, gcc, 0, 0, mode };
+ 	struct sweet_gpu_power_io io = { &ctx, sweet_gpu_power_read,
+-	    sweet_gpu_power_write, sweet_gpu_power_delay, mode == 5 ? sweet_gpu_root_test : NULL };
++	    sweet_gpu_power_write, sweet_gpu_power_delay, mode >= 5 ? sweet_gpu_root_test : NULL };
+ 	struct sweet_gpu_power_result r;
+ 	int result = sweet_gpu_cx_cycle(&io, cx, mx, gfx, &r);
+ 	printf("SWEET GPU: CX cycle levels cx=%u mx=%u gfx=%u result=%d requested=%d restored=%d\n",
+@@ -139,7 +182,7 @@
+ 	printf("SWEET GPU: CX before=%#x hw=%#x gx=%#x ahb=%#x; powered=%#x hw=%#x ahb=%#x; after=%#x hw=%#x gx=%#x\n",
+ 	    r.before, r.hw_before, r.gx_before, r.ahb_before, r.powered,
+ 	    r.hw_powered, r.ahb_powered, r.after, r.hw_after, r.gx_after);
+-	printf("SWEET GPU: CX cycle GMU clock before=%#x after=%#x; inherited votes unchanged, no GMU/GX/rendering\n",
++	printf("SWEET GPU: CX cycle GMU clock before=%#x after=%#x; inherited votes unchanged, no firmware/rendering\n",
+ 	    r.gmu_before, r.gmu_after);
+ }
+ 
+@@ -153,7 +196,7 @@
+ 	clock_interval_to_deadline(90000, NSEC_PER_MSEC, &deadline);
+ 	assert_wait_deadline((event_t)&sweet_gpu_arc_thread, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
+-	if (mode == 4 || mode == 5) {
++	if (mode == 4 || mode == 5 || mode == 6) {
+ 		sweet_gpu_cx_test(mode);
+ 		goto done;
+ 	}
+@@ -174,7 +217,7 @@
+ {
+ 	int mode = 0;
+ 	(void)PE_parse_boot_argn("sweetgpu", &mode, sizeof(mode));
+-	if (mode != 1 && mode != 2 && mode != 3 && mode != 4 && mode != 5) {
++	if (mode != 1 && mode != 2 && mode != 3 && mode != 4 && mode != 5 && mode != 6) {
+ 		return;
+ 	}
+ 	sweet_gpu_fw_probe();
+@@ -213,7 +256,7 @@
+ 	printf("SWEET GPU: GPUCC AHB_CBCR=%#x CX_GMU_CBCR=%#x\n",
+ 	    sweet_gpu_read(cc, 0x1078), sweet_gpu_read(cc, 0x1098));
+ 	printf("SWEET GPU: power/clock observations only; no rendering commands submitted\n");
+-	if (mode == 3 || mode == 4 || mode == 5) {
++	if (mode == 3 || mode == 4 || mode == 5 || mode == 6) {
+ 		thread_t thread;
+ 		kern_return_t kr = kernel_thread_start(sweet_gpu_arc_thread, (void *)(uintptr_t)mode, &thread);
+ 		if (kr == KERN_SUCCESS) {
+--- a/bsd/dev/sweet_gpu_clock.h
++++ b/bsd/dev/sweet_gpu_clock.h
+@@ -23,14 +23,15 @@
+ 	uint32_t (*read)(void *, bool, unsigned); /* true: GCC, false: GPUCC */
+ 	void (*write)(void *, bool, unsigned, uint32_t);
+ 	void (*delay)(unsigned);
++	bool (*running_probe)(void *); /* false: retain root/parent/CX power */
+ };
+ struct sweet_gpu_clock_result {
+ 	uint32_t pll_mode, pll_l, pll_frac, pll_user, pll_opmode;
+ 	uint32_t cmd_before, cfg_before, gate_before, cx_before, gx_before;
+ 	uint32_t cmd_running, cfg_running, cmd_after, cfg_after, gate_after;
+-	bool changed, running, safe_to_collapse;
++	bool changed, running, safe_to_collapse, probe_called;
+ };
+-enum { SGR_OK, SGR_GUARD, SGR_IO, SGR_TIMEOUT, SGR_RESTORE };
++enum { SGR_OK, SGR_GUARD, SGR_IO, SGR_TIMEOUT, SGR_RESTORE, SGR_PROBE_UNSAFE };
+ /* Fabia FSM/vote mode reports ACTIVE in MODE; software OPMODE may remain
+  * STANDBY. Direct mode instead requires OPMODE RUN. Never write the PLL.
+  * Xiaomi clk_fabia_pll_enable() uses this same FSM/direct distinction.
+@@ -134,6 +135,10 @@
+ 	    io->read(io->cookie, true, 0xc) != r->pll_user) { result = SGR_IO; }
+ 	if (io->read(io->cookie, false, SGR_CX) != r->cx_before ||
+ 	    io->read(io->cookie, false, SGR_GX) != r->gx_before) { result = SGR_IO; }
++	if (result == SGR_OK && io->running_probe) {
++		r->probe_called = true;
++		if (!io->running_probe(io->cookie)) { return SGR_PROBE_UNSAFE; }
++	}
+ restore:
+ 	/* Never force-clear UPDATE or drop a parent while a configuration is
+ 	 * uncertain. On incomplete rollback leave CX and its parent powered.
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_gmu_branch.h
+@@ -0,0 +1,99 @@
++/* SM7150 CX_GMU branch cycle with CM3 held in reset. No GMU register writes.
++ * Xiaomi 758bb7ef: gpucc-sdmmagpie.c, clk-branch.c, adreno_a6xx_gmu.c.
++ * Caller has verified/powered CX and forced the nominal 200-MHz root on.
++ */
++#ifndef SWEET_GPU_GMU_BRANCH_H
++#define SWEET_GPU_GMU_BRANCH_H
++#include <stdint.h>
++#include <stdbool.h>
++#define SGB_CX 0x1098u
++#define SGB_OFF (1u << 31)
++#define SGB_WAKE_SLEEP 0xff0u
++struct sweet_gpu_gmu_io {
++	void *cookie;
++	uint32_t (*cc_read)(void *, unsigned);
++	void (*cc_write)(void *, unsigned, uint32_t);
++	uint32_t (*gmu_read)(void *, bool, unsigned); /* AO or CM3, page-relative */
++	void (*delay)(unsigned);
++};
++struct sweet_gpu_gmu_result {
++	uint32_t ahb, cx_hw, root_cmd, root_cfg, before, running, after;
++	uint32_t fence, reset_before, reset_after, fw_result, cm3_cfg;
++	bool registers_read, changed, clock_running, restored, safe_to_stop_root;
++};
++enum { SGB_OK, SGB_GUARD, SGB_IO, SGB_TIMEOUT, SGB_RESTORE, SGB_RESET_UNSAFE };
++static inline bool
++sgb_poll(const struct sweet_gpu_gmu_io *io, bool on)
++{
++	for (unsigned us = 0; us < 500; us++) {
++		uint32_t v = io->cc_read(io->cookie, SGB_CX);
++		if (v == 0xffffffffu) { return false; }
++		if ((v & (SGB_OFF | 1u)) == (on ? 1u : SGB_OFF)) { return true; }
++		io->delay(1);
++	}
++	return false;
++}
++static inline int
++sweet_gpu_gmu_branch_cycle(const struct sweet_gpu_gmu_io *io,
++    struct sweet_gpu_gmu_result *r)
++{
++	*r = (struct sweet_gpu_gmu_result){0};
++	r->safe_to_stop_root = true;
++	r->ahb = io->cc_read(io->cookie, 0x1078);
++	r->cx_hw = io->cc_read(io->cookie, 0x1540);
++	r->root_cmd = io->cc_read(io->cookie, 0x1120);
++	r->root_cfg = io->cc_read(io->cookie, 0x1124);
++	r->before = io->cc_read(io->cookie, SGB_CX);
++	if (r->ahb == 0xffffffffu || (r->ahb & (SGB_OFF | 1u)) != 1u ||
++	    r->cx_hw == 0xffffffffu || !(r->cx_hw & SGB_OFF) ||
++	    r->root_cmd == 0xffffffffu || (r->root_cmd & (SGB_OFF | 3u)) != 2u ||
++	    r->root_cfg == 0xffffffffu || (r->root_cfg & 0x10371fu) != 0x602u ||
++	    r->before == 0xffffffffu || (r->before & (SGB_OFF | 1u)) != SGB_OFF) {
++		return SGB_GUARD;
++	}
++	/* AO base 0x0508c000; enum offsets are GPU dwords, not byte offsets.
++	 * A6XX_GMU_AO_AHB_FENCE_CTRL at GPU word 0x23b10 => PA 0x0508ec40.
++	 * Do not change a fence to make an inaccessible register readable.
++	 */
++	r->fence = io->gmu_read(io->cookie, true, 0x2c40);
++	if (r->fence != 0) { return SGB_GUARD; }
++	/* CM3 base 0x0507c000: SYSRESET at 0x2000 must already be asserted.
++	 * The only GMU accesses here are ordinary read-only status registers.
++	 */
++	r->reset_before = io->gmu_read(io->cookie, false, 0x2000);
++	if (r->reset_before != 1) { return SGB_GUARD; }
++	r->fw_result = io->gmu_read(io->cookie, false, 0x2070);
++	r->cm3_cfg = io->gmu_read(io->cookie, false, 0x20b4);
++	r->registers_read = true;
++	if (r->fw_result == 0xffffffffu || r->cm3_cfg == 0xffffffffu) { return SGB_IO; }
++	r->changed = true;
++	r->safe_to_stop_root = false;
++	uint32_t prepared = (r->before & ~SGB_WAKE_SLEEP) | SGB_WAKE_SLEEP;
++	io->cc_write(io->cookie, SGB_CX, prepared);
++	uint32_t value = io->cc_read(io->cookie, SGB_CX);
++	int result = SGB_IO;
++	if (value == 0xffffffffu || (value & (SGB_WAKE_SLEEP | 1u)) != SGB_WAKE_SLEEP) {
++		goto restore;
++	}
++	io->cc_write(io->cookie, SGB_CX, prepared | 1u);
++	result = sgb_poll(io, true) ? SGB_OK : SGB_TIMEOUT;
++	r->running = io->cc_read(io->cookie, SGB_CX);
++	r->clock_running = result == SGB_OK && r->running != 0xffffffffu &&
++	    (r->running & (SGB_OFF | 1u)) == 1u;
++restore:
++	/* If reset is no longer known asserted, don't gate a possibly live CM3.
++	 * Retain branch/root/CX and stop; no retries, reset release or DMA.
++	 */
++	r->reset_after = io->gmu_read(io->cookie, false, 0x2000);
++	if (r->reset_after != 1) { return SGB_RESET_UNSAFE; }
++	value = io->cc_read(io->cookie, SGB_CX);
++	if (value == 0xffffffffu) { return SGB_RESTORE; }
++	io->cc_write(io->cookie, SGB_CX, value & ~1u);
++	if (!sgb_poll(io, false)) { return SGB_RESTORE; }
++	io->cc_write(io->cookie, SGB_CX, r->before);
++	r->after = io->cc_read(io->cookie, SGB_CX);
++	r->restored = r->after == r->before;
++	r->safe_to_stop_root = r->restored;
++	return r->restored ? result : SGB_RESTORE;
++}
++#endif
