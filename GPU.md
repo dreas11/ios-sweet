@@ -33,6 +33,19 @@ on hardware is pending. Register offsets follow Linux's
 [ARM GIC definitions](https://github.com/torvalds/linux/blob/master/include/linux/irqchip/arm-gic.h)
 and the board's live DT.
 
+Patch 0086 adds opt-in `sweetgpu=4`: after the same 90-second delay, obtain
+fresh ARC reads, validate the returned indexes, require CX >=64, MX >=192 and
+GFX=0, then perform a bounded CX-domain cycle. Require configuration AHB on,
+CX/GX initially collapsed with no override/hardware control, and GMU branch
+explicitly disabled/off. Set CX CLK_DIS_WAIT=8, clear CX SW_COLLAPSE, poll its
+hardware status at 0x1540 for up to 1000 us, record status, then reassert collapse
+and restore original controls after the downstream 100-us disable delay. The
+live CX DT has no clock/reset/bus references beyond its parent supply and hardware
+status register. No RPMh vote, clock, GX, core or GMU register write occurs.
+Control restoration is checked; it is not claimed to prove physical OFF because
+the board explicitly specifies no OFF-status poll. Host tests exercise guards,
+success, timeout, readback failures and restoration failures. Hardware test pending.
+
 The live DT links GPUCC CX/MX/GFX to those three ARC resources. CX's parent
 relationship includes MX; the existing `ldoc11` helper only implements a PMIC
 LDO protocol and must not be reused for ARC. Auxiliary ARC data maps indexes to
@@ -42,7 +55,8 @@ patch's parser/transaction code against a fake RSC and cover malformed maps,
 stale completion status, timeout quarantine, occupied slots, IRQ preservation,
 read-only messages and touch initialization ordering.
 
-It does not write clocks, regulators, GPU or GMU registers. It does not map the
+Modes 1–3 do not write clocks, regulators, GPU or GMU registers. Mode 4 writes
+only the CX GDSCR controls described above. It does not map the
 GPU core or SMMU, allocate DMA, load firmware, publish an accelerator or change
 the framebuffer. GPUCC mode requires its own hardware validation after the
 GCC-only mode. Build and device results are tracked in the active NOTES handoff.

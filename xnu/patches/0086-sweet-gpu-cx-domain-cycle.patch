@@ -1,0 +1,294 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -12,6 +12,8 @@
+  * regulator, uploads firmware, allocates DMA, or advertises acceleration.
+  * sweetgpu=3 additionally schedules delayed RPMh ARC READ transactions.
+  * It programs an empty TCS, but sends no rail votes.
++ * sweetgpu=4 cycles only the CX domain with inherited adequate ARC levels,
++ * then restores its controls; no rail/clock/GMU/GX writes or firmware execution.
+  * Default off; leave the working display path untouched.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -26,6 +28,7 @@
+ void sweet_gpu_probe(void);
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_gpu_arc_read(const char *res);
++extern int sweet_rpmh_gpu_arc_level(const char *res, unsigned *level);
+ 
+ #define GPU_GCC_PA       0x00100000u
+ #define GPU_GCC_SIZE     0x00090000u
+@@ -43,16 +46,72 @@
+ 	return value;
+ }
+ 
++#include "sweet_gpu_power.h"
++
++static uint32_t
++sweet_gpu_power_read(void *cookie, unsigned offset)
++{
++	return sweet_gpu_read((vm_offset_t)cookie, offset);
++}
++
++static void
++sweet_gpu_power_write(void *cookie, unsigned offset, uint32_t value)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)((vm_offset_t)cookie + offset) = value;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++sweet_gpu_power_delay(unsigned us)
++{
++	delay(us);
++}
++
++static void
++sweet_gpu_cx_test(void)
++{
++	unsigned cx = 0, mx = 0, gfx = 0;
++	if (sweet_rpmh_gpu_arc_level("cx.lvl", &cx) ||
++	    sweet_rpmh_gpu_arc_level("mx.lvl", &mx) ||
++	    sweet_rpmh_gpu_arc_level("gfx.lvl", &gfx)) {
++		printf("SWEET GPU: CX cycle aborted: unverified inherited votes\n");
++		return;
++	}
++	vm_offset_t gcc = ml_io_map(GPU_GCC_PA, GPU_GCC_SIZE);
++	if (!gcc || (sweet_gpu_read(gcc, 0x71004) & (GPU_CLK_OFF | 1u)) != 1u) {
++		printf("SWEET GPU: CX cycle aborted: config AHB unavailable\n");
++		return;
++	}
++	vm_offset_t cc = ml_io_map(GPU_CC_PA, GPU_CC_SIZE);
++	if (!cc) { return; }
++	struct sweet_gpu_power_io io = { (void *)cc, sweet_gpu_power_read,
++	    sweet_gpu_power_write, sweet_gpu_power_delay };
++	struct sweet_gpu_power_result r;
++	int result = sweet_gpu_cx_cycle(&io, cx, mx, gfx, &r);
++	printf("SWEET GPU: CX cycle levels cx=%u mx=%u gfx=%u result=%d requested=%d restored=%d\n",
++	    cx, mx, gfx, result, r.requested, r.restored);
++	printf("SWEET GPU: CX before=%#x hw=%#x gx=%#x ahb=%#x; powered=%#x hw=%#x ahb=%#x; after=%#x hw=%#x gx=%#x\n",
++	    r.before, r.hw_before, r.gx_before, r.ahb_before, r.powered,
++	    r.hw_powered, r.ahb_powered, r.after, r.hw_after, r.gx_after);
++	printf("SWEET GPU: CX cycle GMU clock before=%#x after=%#x; inherited votes unchanged, no GMU/GX/rendering\n",
++	    r.gmu_before, r.gmu_after);
++}
++
+ static void
+ sweet_gpu_arc_thread(void *argument, wait_result_t wait_result)
+ {
+-	(void)argument;
++	int mode = (int)(uintptr_t)argument;
+ 	(void)wait_result;
+ 	uint64_t deadline;
+ 	printf("SWEET GPU: ARC reads scheduled after 90 s; touch power has priority\n");
+ 	clock_interval_to_deadline(90000, NSEC_PER_MSEC, &deadline);
+ 	assert_wait_deadline((event_t)&sweet_gpu_arc_thread, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
++	if (mode == 4) {
++		sweet_gpu_cx_test();
++		goto done;
++	}
+ 	const char *resources[] = { "cx.lvl", "mx.lvl", "gfx.lvl" };
+ 	printf("SWEET GPU: RPMh ARC discovery; TCS read requests only, no power votes\n");
+ 	for (unsigned i = 0; i < 3; i++) {
+@@ -60,6 +119,7 @@
+ 			break;
+ 		}
+ 	}
++done:
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+@@ -69,7 +129,7 @@
+ {
+ 	int mode = 0;
+ 	(void)PE_parse_boot_argn("sweetgpu", &mode, sizeof(mode));
+-	if (mode != 1 && mode != 2 && mode != 3) {
++	if (mode != 1 && mode != 2 && mode != 3 && mode != 4) {
+ 		return;
+ 	}
+ 	sweet_gpu_fw_probe();
+@@ -85,7 +145,7 @@
+ 		{ "snoc-dvm", 0x71018 },
+ 	};
+ 	uint32_t cfg = 0;
+-	printf("SWEET GPU: read-only probe mode=%d; software rendering unchanged\n", mode);
++	printf("SWEET GPU: probe mode=%d; software rendering unchanged\n", mode);
+ 	for (unsigned i = 0; i < sizeof(clocks) / sizeof(clocks[0]); i++) {
+ 		uint32_t value = sweet_gpu_read(gcc, clocks[i].offset);
+ 		if (i == 0) {
+@@ -108,9 +168,9 @@
+ 	printf("SWEET GPU: GPUCC AHB_CBCR=%#x CX_GMU_CBCR=%#x\n",
+ 	    sweet_gpu_read(cc, 0x1078), sweet_gpu_read(cc, 0x1098));
+ 	printf("SWEET GPU: power/clock observations only; no rendering commands submitted\n");
+-	if (mode == 3) {
++	if (mode == 3 || mode == 4) {
+ 		thread_t thread;
+-		kern_return_t kr = kernel_thread_start(sweet_gpu_arc_thread, NULL, &thread);
++		kern_return_t kr = kernel_thread_start(sweet_gpu_arc_thread, (void *)(uintptr_t)mode, &thread);
+ 		if (kr == KERN_SUCCESS) {
+ 			thread_deallocate(thread);
+ 		} else {
+--- a/bsd/dev/sweet_rpmh_arc.inc
++++ b/bsd/dev/sweet_rpmh_arc.inc
+@@ -4,6 +4,7 @@
+  */
+ #include "sweet_arc.h"
+ int sweet_rpmh_gpu_arc_read(const char *res);
++int sweet_rpmh_gpu_arc_level(const char *res, unsigned *level);
+ 
+ static int
+ rh_arc_lookup(const char *res, uint32_t *address, uint16_t *levels, unsigned *nlevels)
+@@ -177,8 +178,8 @@
+ 	return error ? error : EIO;
+ }
+ 
+-int
+-sweet_rpmh_gpu_arc_read(const char *res)
++static int
++rh_arc_discover(const char *res, unsigned *level)
+ {
+ 	if (!res || (strcmp(res, "cx.lvl") && strcmp(res, "mx.lvl") && strcmp(res, "gfx.lvl"))) {
+ 		return EINVAL;
+@@ -210,11 +211,21 @@
+ 		error = rh_arc_read(address, &response);
+ 	}
+ 	if (!error) {
+-		/* Keep this raw until ARC read semantics are verified on the board.
+-		 * Do not use it as an inherited vote to restore or lower a shared rail.
++		/* Qualcomm upstream defines this as the DRV vote, not aggregate.
++		 * Only the level API below bounds-checks it against the ARC table.
+ 		 */
+-		printf("SWEET GPU: ARC %s read-response=%#x (not a voltage or saved HLOS vote)\n",
++		printf("SWEET GPU: ARC %s read-response=%#x (raw DRV response, not a voltage)\n",
+ 		    res, response);
++	}
++	if (!error && level) {
++		/* Qualcomm upstream: READ returns this DRV's vote, not aggregate.
++		 * Treat it as an index only after fresh completion and table bounds.
++		 */
++		if (response >= count) {
++			error = EINVAL;
++		} else {
++			*level = levels[response];
++		}
+ 	}
+ out:
+ 	if (error) {
+@@ -223,3 +234,15 @@
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++
++int
++sweet_rpmh_gpu_arc_read(const char *res)
++{
++	return rh_arc_discover(res, NULL);
++}
++
++int
++sweet_rpmh_gpu_arc_level(const char *res, unsigned *level)
++{
++	return level ? rh_arc_discover(res, level) : EINVAL;
++}
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_power.h
+@@ -0,0 +1,98 @@
++/* Isolated CX-domain cycle. No rail votes, clocks, GX, core, GMU or DMA writes.
++ * Board sequence: Xiaomi 758bb7ef gdsc-regulator.c + sdmmagpie-gdsc.dtsi.
++ * Caller is the sole GPU power owner and has freshly verified inherited rails.
++ */
++#ifndef SWEET_GPU_POWER_H
++#define SWEET_GPU_POWER_H
++#include <stdint.h>
++#include <stdbool.h>
++#define SGC_CTRL 0x106cu
++#define SGC_HW 0x1540u
++#define SGC_GX 0x100cu
++#define SGC_AHB 0x1078u
++#define SGC_GMU 0x1098u
++#define SGC_ON (1u << 31)
++#define SGC_COLLAPSE 1u
++#define SGC_WAIT 0xf000u
++#define SGC_FIELDS 0xf007u
++struct sweet_gpu_power_io {
++	void *cookie;
++	uint32_t (*read)(void *, unsigned);
++	void (*write)(void *, unsigned, uint32_t);
++	void (*delay)(unsigned);
++};
++struct sweet_gpu_power_result {
++	uint32_t before, hw_before, gx_before, ahb_before, gmu_before;
++	uint32_t powered, hw_powered, ahb_powered;
++	uint32_t after, hw_after, gx_after, gmu_after;
++	bool requested, restored;
++};
++enum { SGC_OK, SGC_GUARD, SGC_IO, SGC_TIMEOUT, SGC_RESTORE };
++static inline bool
++sgc_write_check(const struct sweet_gpu_power_io *io, uint32_t value)
++{
++	io->write(io->cookie, SGC_CTRL, value);
++	uint32_t read = io->read(io->cookie, SGC_CTRL);
++	return read != 0xffffffffu && (read & SGC_FIELDS) == (value & SGC_FIELDS);
++}
++static inline int
++sweet_gpu_cx_cycle(const struct sweet_gpu_power_io *io, unsigned cx_level,
++    unsigned mx_level, unsigned gfx_level, struct sweet_gpu_power_result *out)
++{
++	*out = (struct sweet_gpu_power_result){0};
++	if (cx_level < 64 || mx_level < 192 || gfx_level != 0) { return SGC_GUARD; }
++	out->before = io->read(io->cookie, SGC_CTRL);
++	out->hw_before = io->read(io->cookie, SGC_HW);
++	out->gx_before = io->read(io->cookie, SGC_GX);
++	out->ahb_before = io->read(io->cookie, SGC_AHB);
++	out->gmu_before = io->read(io->cookie, SGC_GMU);
++	/* Don't take over an active domain, hardware-managed domain or override. */
++	if (out->before == 0xffffffffu || out->hw_before == 0xffffffffu ||
++	    out->gx_before == 0xffffffffu || out->ahb_before == 0xffffffffu ||
++	    out->gmu_before == 0xffffffffu ||
++	    (out->gmu_before & (SGC_ON | 1u)) != SGC_ON ||
++	    (out->before & (SGC_ON | 7u)) != SGC_COLLAPSE ||
++	    (out->hw_before & SGC_ON) ||
++	    (out->gx_before & (SGC_ON | 7u)) != SGC_COLLAPSE ||
++	    !(out->ahb_before & 1u)) { return SGC_GUARD; }
++	uint32_t prepared = (out->before & ~SGC_WAIT) | 0x8000u;
++	int result = SGC_IO;
++	bool collapsed, restored;
++	out->requested = true;
++	if (!sgc_write_check(io, prepared) || !sgc_write_check(io, prepared & ~SGC_COLLAPSE)) {
++		goto restore;
++	}
++	io->delay(1); /* At least 8 XO cycles, as downstream. */
++	result = SGC_TIMEOUT;
++	for (unsigned us = 0; us < 1000; us++) { /* Two bounded 500-us polls. */
++		uint32_t status = io->read(io->cookie, SGC_HW);
++		if (status == 0xffffffffu) { result = SGC_IO; break; }
++		if (status & SGC_ON) { result = SGC_OK; break; }
++		io->delay(1);
++	}
++	if (result == SGC_OK) {
++		io->delay(2); /* Memory staggering/clock recovery delay. */
++		out->powered = io->read(io->cookie, SGC_CTRL);
++		out->hw_powered = io->read(io->cookie, SGC_HW);
++		out->ahb_powered = io->read(io->cookie, SGC_AHB);
++		if (out->powered == 0xffffffffu || out->hw_powered == 0xffffffffu ||
++		    out->ahb_powered == 0xffffffffu || !(out->hw_powered & SGC_ON)) { result = SGC_IO; }
++	}
++restore:
++	/* Re-collapse with the eight-cycle setting before restoring the old wait.
++	 * CX DT deliberately skips OFF status polling (AOP may hold it on).
++	 * No firmware/DMA was started, so no work can race this collapse request.
++	 */
++	collapsed = sgc_write_check(io, prepared | SGC_COLLAPSE);
++	io->delay(1);
++	io->delay(100);
++	restored = sgc_write_check(io, out->before);
++	out->after = io->read(io->cookie, SGC_CTRL);
++	out->hw_after = io->read(io->cookie, SGC_HW);
++	out->gx_after = io->read(io->cookie, SGC_GX);
++	out->gmu_after = io->read(io->cookie, SGC_GMU);
++	out->restored = collapsed && restored && out->gx_after == out->gx_before &&
++	    out->gmu_after == out->gmu_before;
++	return out->restored ? result : SGC_RESTORE;
++}
++#endif

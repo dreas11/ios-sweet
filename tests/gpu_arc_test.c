@@ -26,7 +26,7 @@
 #define RH_DB_ENTRY 24u
 #define RH_TIMEOUT_US 100u
 typedef uintptr_t vm_offset_t;
-static uint32_t gic_enabled, gic_active;
+static uint32_t gic_enabled, gic_active, response_value;
 static bool map_fail;
 static vm_offset_t ml_io_map(vm_offset_t pa, size_t size)
 {
@@ -59,7 +59,7 @@ static void rh_write(uintptr_t base, uint32_t offset, uint32_t value)
     regs[offset/4] = value;
     if (offset == RH_CONTROL && value == (RH_AMC_EN | RH_TRIGGER)) {
         regs[RH_CMD_STATUS/4] = RH_ISSUED | RH_COMPLETE;
-        regs[0x40/4] = 0x76543210; /* Preserve raw responses, don't invent units. */
+        regs[0x40/4] = response_value; /* Preserve raw responses, don't invent units. */
         if (scenario == 0 && (regs[RH_IRQ_EN/4] & 1)) {
             regs[RH_IRQ_STATUS/4] |= 1;
         }
@@ -96,6 +96,7 @@ static void reset(void)
     regs[RH_IRQ_EN/4] = 0x55;
     regs[RH_IRQ_STATUS/4] = 0x80; /* Unrelated interrupt must survive. */
     ticks = writes = scenario = rh_lock = 0;
+    response_value = 0x76543210;
     gic_enabled = gic_active = 0; map_fail = false; rh_arc_gicd = 0;
     rh_poisoned = false; rh_touch_ready = true;
 }
@@ -167,6 +168,12 @@ int main(void)
     reset(); rh_poisoned = true;
     assert(sweet_rpmh_gpu_arc_read("cx.lvl") == EIO && writes == 0 && !rh_lock);
     assert(sweet_rpmh_gpu_arc_read("ldoc11") == EINVAL && writes == 0);
+    reset(); dictionary(); response_value = 2;
+    unsigned level = 999;
+    assert(!sweet_rpmh_gpu_arc_level("cx.lvl", &level) && level == 64);
+    reset(); dictionary(); level = 999;
+    assert(sweet_rpmh_gpu_arc_level("cx.lvl", &level) == EINVAL && level == 999);
+    assert(sweet_rpmh_gpu_arc_level("cx.lvl", NULL) == EINVAL);
     puts("ARC policy and transaction tests PASS");
     return 0;
 }

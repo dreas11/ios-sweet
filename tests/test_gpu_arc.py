@@ -32,6 +32,7 @@ class GPUArcTests(unittest.TestCase):
                 (directory / name).write_text(added_file(patch, name))
             subprocess.run(['git', 'apply', str(ROOT / 'xnu/patches/0084-sweet-rpmh-arc-completion-latch.patch')],
                            cwd=tmp, check=True, capture_output=True)
+            subprocess.run(['git', 'apply', '--include=bsd/dev/sweet_rpmh_arc.inc', str(ROOT / 'xnu/patches/0086-sweet-gpu-cx-domain-cycle.patch')], cwd=tmp, check=True, capture_output=True)
             binary = directory / 'test-arc'
             subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror',
                             '-I', str(directory), str(ROOT / 'tests/gpu_arc_test.c'),
