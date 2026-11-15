@@ -25,12 +25,24 @@
 #define RH_DB_HEADER 144u
 #define RH_DB_ENTRY 24u
 #define RH_TIMEOUT_US 100u
+typedef uintptr_t vm_offset_t;
+static uint32_t gic_enabled, gic_active;
+static bool map_fail;
+static vm_offset_t ml_io_map(vm_offset_t pa, size_t size)
+{
+    assert(pa == 0x17a00000 && size == 0x1000);
+    return map_fail ? 0 : 3;
+}
 static uint32_t regs[0x3000/4], db[1024/4];
 static unsigned rh_ncpt = 16, rh_lock, ticks, writes, scenario;
 static bool rh_poisoned, rh_touch_ready;
 static uintptr_t rh_tcs = 1, rh_db = 2;
 static uint32_t rh_read(uintptr_t base, uint32_t offset)
 {
+    if (base == 3) {
+        assert(offset == 0x104 || offset == 0x304);
+        return offset == 0x104 ? gic_enabled : gic_active;
+    }
     return base == rh_db ? db[offset/4] : regs[offset/4];
 }
 static void rh_write(uintptr_t base, uint32_t offset, uint32_t value)
@@ -48,7 +60,7 @@ static void rh_write(uintptr_t base, uint32_t offset, uint32_t value)
     if (offset == RH_CONTROL && value == (RH_AMC_EN | RH_TRIGGER)) {
         regs[RH_CMD_STATUS/4] = RH_ISSUED | RH_COMPLETE;
         regs[0x40/4] = 0x76543210; /* Preserve raw responses, don't invent units. */
-        if (scenario == 0) {
+        if (scenario == 0 && (regs[RH_IRQ_EN/4] & 1)) {
             regs[RH_IRQ_STATUS/4] |= 1;
         }
     }
@@ -84,6 +96,7 @@ static void reset(void)
     regs[RH_IRQ_EN/4] = 0x55;
     regs[RH_IRQ_STATUS/4] = 0x80; /* Unrelated interrupt must survive. */
     ticks = writes = scenario = rh_lock = 0;
+    gic_enabled = gic_active = 0; map_fail = false; rh_arc_gicd = 0;
     rh_poisoned = false; rh_touch_ready = true;
 }
 static void put16(unsigned off, uint16_t v)
@@ -122,6 +135,19 @@ int main(void)
     assert(!rh_arc_read(0x30000, &response));
     assert(response == 0x76543210 && !rh_poisoned && ticks == 0);
     assert(rh_free(0) && regs[RH_IRQ_EN/4] == 0x55 && regs[RH_IRQ_STATUS/4] == 0x80);
+    reset(); regs[RH_IRQ_EN/4] = 0x54;
+    assert(!rh_arc_read(0x30000, &response));
+    assert(regs[RH_IRQ_EN/4] == 0x54 && rh_free(0));
+    reset(); gic_enabled = 1u << 5;
+    assert(rh_arc_read(0x30000, &response) == EBUSY && writes == 0);
+    reset(); gic_active = 1u << 5;
+    assert(rh_arc_read(0x30000, &response) == EBUSY && writes == 0);
+    reset(); gic_enabled = UINT32_MAX;
+    assert(rh_arc_read(0x30000, &response) == EBUSY && writes == 0);
+    reset(); gic_active = UINT32_MAX;
+    assert(rh_arc_read(0x30000, &response) == EBUSY && writes == 0);
+    reset(); map_fail = true;
+    assert(rh_arc_read(0x30000, &response) == ENOMEM && writes == 0);
     reset(); scenario = 1;
     assert(rh_arc_read(0x30000, &response) == ETIMEDOUT);
     assert(rh_poisoned && ticks == RH_TIMEOUT_US && !(regs[RH_IRQ_EN/4] & 1));

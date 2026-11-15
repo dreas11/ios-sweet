@@ -26,12 +26,15 @@ class GPUArcTests(unittest.TestCase):
     def test_policy_and_controller_failures(self):
         patch = (ROOT / 'xnu/patches/0083-sweet-gpu-rpmh-arc-discovery.patch').read_text()
         with tempfile.TemporaryDirectory() as tmp:
-            directory = pathlib.Path(tmp)
+            directory = pathlib.Path(tmp) / 'bsd/dev'
+            directory.mkdir(parents=True)
             for name in ('sweet_arc.h', 'sweet_rpmh_arc.inc'):
                 (directory / name).write_text(added_file(patch, name))
+            subprocess.run(['git', 'apply', str(ROOT / 'xnu/patches/0084-sweet-rpmh-arc-completion-latch.patch')],
+                           cwd=tmp, check=True, capture_output=True)
             binary = directory / 'test-arc'
             subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror',
-                            '-I', tmp, str(ROOT / 'tests/gpu_arc_test.c'),
+                            '-I', str(directory), str(ROOT / 'tests/gpu_arc_test.c'),
                             '-o', str(binary)], check=True, capture_output=True)
             result = subprocess.run([str(binary)], check=True, capture_output=True, text=True)
             self.assertIn('ARC policy and transaction tests PASS', result.stdout)

@@ -1,0 +1,99 @@
+--- a/bsd/dev/sweet_rpmh_arc.inc
++++ b/bsd/dev/sweet_rpmh_arc.inc
+@@ -53,9 +53,39 @@
+ 	return matches == 1 ? 0 : ENODEV;
+ }
+ 
++/* The live sweet DT assigns apps RSC SPI 5 (INTID 37) to GICD
++ * 0x17a00000. Keep its CPU delivery disabled; poll the RSC completion latch.
++ * This client never changes GIC configuration or registers an IRQ handler.
++ * Non-secure Group 1 enable/active status is readable without IGROUPR access.
++ */
++static vm_offset_t rh_arc_gicd;
++
++static int
++rh_arc_irq_guard(void)
++{
++	if (!rh_arc_gicd) {
++		rh_arc_gicd = ml_io_map(0x17a00000u, 0x1000);
++	}
++	if (!rh_arc_gicd) {
++		return ENOMEM;
++	}
++	uint32_t enabled = rh_read(rh_arc_gicd, 0x104);
++	uint32_t active = rh_read(rh_arc_gicd, 0x304);
++	printf("SWEET RPMH: ARC GIC INTID37 enable=%#x active=%#x\n", enabled, active);
++	if (enabled == 0xffffffffu || active == 0xffffffffu ||
++	    ((enabled | active) & (1u << 5))) {
++		return EBUSY;
++	}
++	return 0;
++}
++
+ static int
+ rh_arc_read(uint32_t address, uint32_t *response)
+ {
++	int error = rh_arc_irq_guard();
++	if (error) {
++		return error;
++	}
+ 	int chosen = -1;
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; t++) {
+ 		uint32_t b = t * RH_TCS_STRIDE;
+@@ -82,8 +112,10 @@
+ 	if (irq_en == 0xffffffffu || !rh_free(t)) {
+ 		return EBUSY;
+ 	}
+-	if (!rh_sync(RH_IRQ_EN, irq_en & ~bit)) {
++	/* IRQ_ENABLE gates the status latch on this RSC. CPU delivery stays masked. */
++	if (!rh_sync(RH_IRQ_EN, irq_en | bit)) {
+ 		rh_poisoned = true;
++		(void)rh_sync(RH_IRQ_EN, rh_read(rh_tcs, RH_IRQ_EN) & ~bit);
+ 		return EIO;
+ 	}
+ 	if (!rh_free(t)) {
+@@ -100,7 +132,7 @@
+ 	    !rh_sync(b + RH_ADDR, address) || !rh_sync(b + RH_DATA, 0) ||
+ 	    !rh_sync(b + RH_WAIT, 1) || !rh_sync(b + RH_ENABLE, 1) ||
+ 	    !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
+-		return EIO;
++		goto failed;
+ 	}
+ 	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
+ 	bool done = false;
+@@ -122,22 +154,27 @@
+ 	    t, address, done, irq, idle, status);
+ 	if (!done) {
+ 		printf("SWEET RPMH: ARC timeout; slot quarantined, no retry or power writes\n");
+-		return ETIMEDOUT;
++		error = ETIMEDOUT;
++		goto failed;
+ 	}
+ 	/* Downstream RSC_DRV_CMD_RESP_DATA, not the request DATA register. */
+ 	uint32_t value = rh_read(rh_tcs, b + 0x40);
+ 	if (!rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, 0) ||
+ 	    !rh_sync(b + RH_ENABLE, 0) || !rh_sync(b + RH_WAIT, 0)) {
+-		return EIO;
++		goto failed;
+ 	}
+ 	rh_write(rh_tcs, RH_IRQ_CLEAR, bit);
+ 	if ((rh_read(rh_tcs, RH_IRQ_STATUS) & bit) ||
+ 	    !rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | (irq_en & bit))) {
+-		return EIO;
++		goto failed;
+ 	}
+ 	rh_poisoned = false;
+ 	*response = value;
+ 	return 0;
++failed:
++	/* Never re-enable an uncertain completion source or reuse its TCS. */
++	(void)rh_sync(RH_IRQ_EN, rh_read(rh_tcs, RH_IRQ_EN) & ~bit);
++	return error ? error : EIO;
+ }
+ 
+ int
+@@ -186,4 +223,3 @@
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
+-
