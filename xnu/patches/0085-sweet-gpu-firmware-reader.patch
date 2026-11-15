@@ -118,7 +118,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_firmware.inc
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,62 @@
 +/* Optional CPU-only firmware validation; no firmware is authenticated/executed. */
 +#include <pexpert/boot.h>
 +#include <pexpert/device_tree.h>
@@ -131,7 +131,12 @@
 +sweet_gpu_fw_digest(const uint8_t *data, size_t size, const uint8_t *expected)
 +{
 +	uint8_t digest[32];
-+	ccdigest(ccsha256_di(), size, data, digest);
++	/* XNU's built-in subset exports init/update/final, not ccdigest(). */
++	const struct ccdigest_info *di = ccsha256_di();
++	ccdigest_ctx_decl(CCSHA256_STATE_SIZE, CCSHA256_BLOCK_SIZE, ctx);
++	ccdigest_init(di, ctx);
++	ccdigest_update(di, ctx, size, data);
++	ccdigest_final(di, ctx, digest);
 +	return memcmp(digest, expected, sizeof(digest)) == 0;
 +}
 +
