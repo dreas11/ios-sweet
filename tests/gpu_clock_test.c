@@ -23,6 +23,8 @@ static void wr(void *cookie, bool is_gcc, unsigned off, uint32_t value)
     }
     if (value & SGR_FORCE) {
         if (scenario!=2) cc[off/4]&=~SGR_OFF;
+        if (scenario==6) gcc[0]&=~SGR_PLL_ACTIVE;
+        if (scenario==7) gcc[0x2c/4]=0;
         gcc[SGR_GATE/4]|=0x80; /* Concurrent unrelated voter must survive. */
     } else if (scenario!=4 || writes<5) cc[off/4]|=SGR_OFF;
     else cc[off/4]&=~SGR_OFF;
@@ -46,6 +48,20 @@ int main(void)
     reset();gcc[SGR_GATE/4]|=SGR_GATE_BIT;cc[SGR_CFG/4]=0x40000602;
     assert(sweet_gpu_gmu_root_cycle(&io,&r)==SGR_OK && r.cfg_after==0x40000602);
     assert(gcc[SGR_GATE/4] & SGR_GATE_BIT);
+    /* Real Redmi snapshot: FSM active+locked, OPMODE software field zero. */
+    reset();gcc[0]=0xd0100005;gcc[0x2c/4]=0;gcc[0xc/4]=0x103;
+    assert(sweet_gpu_gmu_root_cycle(&io,&r)==SGR_OK && r.running && r.safe_to_collapse);
+    assert(gcc[0]==0xd0100005 && gcc[0x2c/4]==0 && gcc[0xc/4]==0x103);
+    reset();gcc[0]=0x90100005;gcc[0x2c/4]=0;
+    assert(sweet_gpu_gmu_root_cycle(&io,&r)==SGR_GUARD && writes==0);
+    reset();gcc[0x2c/4]=0;
+    assert(sweet_gpu_gmu_root_cycle(&io,&r)==SGR_GUARD && writes==0);
+    reset();gcc[0]=0x50100005;gcc[0x2c/4]=0;
+    assert(sweet_gpu_gmu_root_cycle(&io,&r)==SGR_GUARD && writes==0);
+    reset();gcc[0]=0xd0100005;gcc[0x2c/4]=0;scenario=6;
+    assert(sweet_gpu_gmu_root_cycle(&io,&r)==SGR_IO && r.safe_to_collapse);
+    reset();scenario=7;
+    assert(sweet_gpu_gmu_root_cycle(&io,&r)==SGR_IO && r.safe_to_collapse);
     const unsigned go[]={0,4,0x38,0xc,0x2c,SGR_GATE};
     const unsigned co[]={SGR_CMD,SGR_CFG,SGR_CX,SGR_GX};
     for(unsigned i=0;i<6;i++){reset();gcc[go[i]/4]=UINT32_MAX;assert(sweet_gpu_gmu_root_cycle(&io,&r)==SGR_GUARD && writes==0 && r.safe_to_collapse);}

@@ -60,7 +60,17 @@ Unexpected clock rollback leaves CX and the parent powered and stops all further
 GPU operations, rather than removing power from uncertain clock state. Host
 models cover malformed/unavailable registers, active consumers, unrelated parent
 votes, update/enable/disable/restore failures, and the CX keep-powered failure
-path. This stage is not yet hardware-verified and executes no GPU firmware.
+path. The first device test preserved Home/touch and restored CX but rejected the
+root-clock cycle before any clock write: GPLL0 MODE=0xd0100005 has FSM+ACTIVE+
+LOCK set while software OPMODE is zero. Root enable remains unverified.
+
+Patch 0088 corrects the guard using the downstream
+[Fabia FSM/direct distinction](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/758bb7ef50af360e728662a1ed3b3a1b977a2f13/drivers/clk/qcom/clk-alpha-pll.c):
+FSM mode requires ACTIVE, direct mode requires OPMODE RUN. Both retain the
+LOCK/output/reset and fixed-frequency checks; no PLL writes are introduced.
+The running-root check repeats this validation and rejects a control-mode change.
+Host tests cover the observed FSM snapshot, inactive/unlocked FSM, direct standby,
+and loss of readiness during the cycle. Hardware verification is pending.
 
 The live DT links GPUCC CX/MX/GFX to those three ARC resources. CX's parent
 relationship includes MX; the existing `ldoc11` helper only implements a PMIC

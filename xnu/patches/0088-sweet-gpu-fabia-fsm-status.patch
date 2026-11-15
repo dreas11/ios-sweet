@@ -1,0 +1,51 @@
+--- a/bsd/dev/sweet_gpu_clock.h
++++ b/bsd/dev/sweet_gpu_clock.h
+@@ -16,6 +16,8 @@
+ #define SGR_UPDATE 1u
+ #define SGR_FORCE 2u
+ #define SGR_CFG_MASK 0x10371fu
++#define SGR_PLL_FSM (1u << 20)
++#define SGR_PLL_ACTIVE (1u << 30)
+ struct sweet_gpu_clock_io {
+ 	void *cookie;
+ 	uint32_t (*read)(void *, bool, unsigned); /* true: GCC, false: GPUCC */
+@@ -29,6 +31,17 @@
+ 	bool changed, running, safe_to_collapse;
+ };
+ enum { SGR_OK, SGR_GUARD, SGR_IO, SGR_TIMEOUT, SGR_RESTORE };
++/* Fabia FSM/vote mode reports ACTIVE in MODE; software OPMODE may remain
++ * STANDBY. Direct mode instead requires OPMODE RUN. Never write the PLL.
++ * Xiaomi clk_fabia_pll_enable() uses this same FSM/direct distinction.
++ */
++static inline bool
++sgr_pll_running(uint32_t mode, uint32_t opmode)
++{
++	if (mode == 0xffffffffu || opmode == 0xffffffffu ||
++	    (mode & (SGR_OFF | 5u)) != (SGR_OFF | 5u)) { return false; }
++	return (mode & SGR_PLL_FSM) ? (mode & SGR_PLL_ACTIVE) != 0 : opmode == 1;
++}
+ static inline bool
+ sgr_poll(const struct sweet_gpu_clock_io *io, unsigned offset, uint32_t mask, uint32_t expect)
+ {
+@@ -80,8 +93,8 @@
+ 	 * Both consumers must stay gated. Only restore known XO or GPLL0/div2.
+ 	 */
+ 	if (r->pll_mode == 0xffffffffu || r->pll_user == 0xffffffffu ||
+-	    (r->pll_mode & (SGR_OFF | 5u)) != (SGR_OFF | 5u) ||
+-	    r->pll_l != 31 || r->pll_frac != 0x4000 || r->pll_opmode != 1 ||
++	    !sgr_pll_running(r->pll_mode, r->pll_opmode) ||
++	    r->pll_l != 31 || r->pll_frac != 0x4000 ||
+ 	    !(r->pll_user & 1u) || r->gate_before == 0xffffffffu ||
+ 	    r->cmd_before == 0xffffffffu ||
+ 	    (r->cmd_before & (SGR_OFF | 0xf3u)) != SGR_OFF ||
+@@ -116,7 +129,9 @@
+ 	    pll_now == 0xffffffffu) { result = SGR_IO; }
+ 	if (io->read(io->cookie, true, 0x4) != r->pll_l ||
+ 	    io->read(io->cookie, true, 0x38) != r->pll_frac ||
+-	    (pll_now & (SGR_OFF | 5u)) != (SGR_OFF | 5u)) { result = SGR_IO; }
++	    !sgr_pll_running(pll_now, io->read(io->cookie, true, 0x2c)) ||
++	    ((pll_now ^ r->pll_mode) & SGR_PLL_FSM) ||
++	    io->read(io->cookie, true, 0xc) != r->pll_user) { result = SGR_IO; }
+ 	if (io->read(io->cookie, false, SGR_CX) != r->cx_before ||
+ 	    io->read(io->cookie, false, SGR_GX) != r->gx_before) { result = SGR_IO; }
+ restore:
