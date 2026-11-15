@@ -1,0 +1,112 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_gpu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_gpu_probe(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -660,6 +661,7 @@
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	sweet_gpu_probe();
+ 	return 0;
+ }
+ 
+--- /dev/null
++++ b/bsd/dev/sweet_gpu.c
+@@ -0,0 +1,81 @@
++/*
++ * SWEET / Adreno 618: opt-in, read-only power/clock discovery.
++ *
++ * Register provenance: Xiaomi sweet-r-oss, revision
++ * 758bb7ef50af360e728662a1ed3b3a1b977a2f13:
++ * drivers/clk/qcom/{gcc,gpucc}-sdmmagpie.c and
++ * arch/arm64/boot/dts/qcom/sdmmagpie{,-gdsc,-gpu}.dtsi.
++ *
++ * sweetgpu=1 reads only GCC clock status. sweetgpu=2 additionally reads
++ * the GPU clock controller if its GCC configuration bus is clocked.
++ * Neither mode accesses GPU/GMU/SMMU core registers, changes a clock or
++ * regulator, uploads firmware, allocates DMA, or advertises acceleration.
++ * Default off; leave the working display path untouched.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_gpu_probe(void);
++
++#define GPU_GCC_PA       0x00100000u
++#define GPU_GCC_SIZE     0x00090000u
++#define GPU_CC_PA        0x05090000u
++#define GPU_CC_SIZE      0x00009000u
++#define GPU_CLK_OFF      (1u << 31)
++
++static uint32_t
++sweet_gpu_read(vm_offset_t base, unsigned offset)
++{
++	uint32_t value = *(volatile uint32_t *)(base + offset);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return value;
++}
++
++void
++sweet_gpu_probe(void)
++{
++	int mode = 0;
++	(void)PE_parse_boot_argn("sweetgpu", &mode, sizeof(mode));
++	if (mode != 1 && mode != 2) {
++		return;
++	}
++	vm_offset_t gcc = ml_io_map(GPU_GCC_PA, GPU_GCC_SIZE);
++	if (gcc == 0) {
++		printf("SWEET GPU: GCC mapping failed\n");
++		return;
++	}
++	static const struct { const char *name; unsigned offset; } clocks[] = {
++		{ "cfg-ahb", 0x71004 },
++		{ "ddrss-axi", 0x4452c },
++		{ "memnoc", 0x7100c },
++		{ "snoc-dvm", 0x71018 },
++	};
++	uint32_t cfg = 0;
++	printf("SWEET GPU: read-only probe mode=%d; software rendering unchanged\n", mode);
++	for (unsigned i = 0; i < sizeof(clocks) / sizeof(clocks[0]); i++) {
++		uint32_t value = sweet_gpu_read(gcc, clocks[i].offset);
++		if (i == 0) {
++			cfg = value;
++		}
++		printf("SWEET GPU: GCC %s CBCR=%#x (%s)\n", clocks[i].name,
++		    value, (value & GPU_CLK_OFF) ? "off" : "on");
++	}
++	if (mode == 1 || (cfg & (GPU_CLK_OFF | 1u)) != 1u || cfg == 0xffffffffu) {
++		printf("SWEET GPU: GPUCC/core/GMU/SMMU not accessed\n");
++		return;
++	}
++	vm_offset_t cc = ml_io_map(GPU_CC_PA, GPU_CC_SIZE);
++	if (cc == 0) {
++		printf("SWEET GPU: GPUCC mapping failed\n");
++		return;
++	}
++	printf("SWEET GPU: GPUCC CX_GDSCR=%#x GX_GDSCR=%#x\n",
++	    sweet_gpu_read(cc, 0x106c), sweet_gpu_read(cc, 0x100c));
++	printf("SWEET GPU: GPUCC AHB_CBCR=%#x CX_GMU_CBCR=%#x\n",
++	    sweet_gpu_read(cc, 0x1078), sweet_gpu_read(cc, 0x1098));
++	printf("SWEET GPU: power/clock observations only; no rendering commands submitted\n");
++}
++#endif
