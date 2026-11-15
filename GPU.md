@@ -83,7 +83,15 @@ complete ZAP ELF. `tools/mkpayload.py --gpu-firmware BUNDLE` adds a reserved
 segment after the kernel/optional RAM disk and puts `<physical address, byte
 length>` in `/chosen/memory-map/GPUFirmware` (two little-endian u64s). It advances
 `kernel_end`, so the existing shim keeps the segment below `topOfKernelData`.
-No firmware is executed and current kernels do not consume this property yet.
+Patch 0085 adds an optional kernel reader (`sweetgpufw=1` alongside a nonzero
+`sweetgpu` mode). It accepts only a page-aligned region entirely inside
+boot-reserved RAM, uses the existing normal-memory mapping, validates every
+entry, SHA256 digest and firmware format, and reports lengths. It publishes no
+accelerator, performs no upload and interprets no ELF address as a CPU physical
+address. Default-off, independent from the RPMh mode. Host tests compare the
+exact C parser with the packer across truncations, byte mutations, overflowing
+lengths and malformed inner images with recomputed hashes. Hardware verification
+is pending; checksum validation is not firmware authentication.
 
 Bundle layout: 32-byte `<8sII16s>` header (magic, version 1, count 3, zero reserved
 bytes), then three 56-byte `<IIQQ32s>` records (kind, zero flags, offset, length,

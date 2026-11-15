@@ -1,0 +1,178 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -32,6 +32,8 @@
+ #define GPU_CC_PA        0x05090000u
+ #define GPU_CC_SIZE      0x00009000u
+ #define GPU_CLK_OFF      (1u << 31)
++
++#include "sweet_gpu_firmware.inc"
+ 
+ static uint32_t
+ sweet_gpu_read(vm_offset_t base, unsigned offset)
+@@ -70,6 +72,7 @@
+ 	if (mode != 1 && mode != 2 && mode != 3) {
+ 		return;
+ 	}
++	sweet_gpu_fw_probe();
+ 	vm_offset_t gcc = ml_io_map(GPU_GCC_PA, GPU_GCC_SIZE);
+ 	if (gcc == 0) {
+ 		printf("SWEET GPU: GCC mapping failed\n");
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_firmware.h
+@@ -0,0 +1,96 @@
++/* SWGPUFW1 bounded, allocation-free reader. SHA256 checks integrity, not trust.
++ * Caller supplies immutable CPU memory and a digest verifier. No MMIO or DMA.
++ */
++#ifndef SWEET_GPU_FIRMWARE_H
++#define SWEET_GPU_FIRMWARE_H
++#include <stdint.h>
++#include <stddef.h>
++#include <stdbool.h>
++#define SWEET_GPU_FW_LIMIT 0x100000u
++struct sweet_gpu_fw_image { const uint8_t *data; size_t size; };
++typedef bool (*sweet_gpu_fw_hash)(const uint8_t *, size_t, const uint8_t *);
++static inline uint32_t sgfw_u32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++static inline uint64_t sgfw_u64(const uint8_t *p)
++{
++	return sgfw_u32(p) | (uint64_t)sgfw_u32(p + 4) << 32;
++}
++static inline unsigned sgfw_u16(const uint8_t *p)
++{
++	return p[0] | (unsigned)p[1] << 8;
++}
++static inline bool sgfw_zero(const uint8_t *p, size_t n)
++{
++	for (size_t i = 0; i < n; i++) {
++		if (p[i]) { return false; }
++	}
++	return true;
++}
++static inline bool sgfw_zap(const uint8_t *p, size_t n)
++{
++	static const uint8_t magic[] = {0x7f, 'E', 'L', 'F', 1, 1, 1};
++	if (n < 52 || n > 0x40000) { return false; }
++	for (unsigned i = 0; i < sizeof(magic); i++) {
++		if (p[i] != magic[i]) { return false; }
++	}
++	uint32_t off = sgfw_u32(p + 28);
++	unsigned count = sgfw_u16(p + 44);
++	if (sgfw_u16(p + 18) != 164 || sgfw_u32(p + 20) != 1 ||
++	    sgfw_u16(p + 40) != 52 || sgfw_u16(p + 42) != 32 ||
++	    count < 1 || count > 16 || off < 52 || off > n || count * 32u > n - off) {
++		return false;
++	}
++	bool loaded = false;
++	for (unsigned i = 0; i < count; i++) {
++		const uint8_t *h = p + off + i * 32u;
++		if (sgfw_u32(h) != 1 || (sgfw_u32(h + 24) & 0x07000000u) == 0x02000000u) {
++			continue;
++		}
++		uint32_t file = sgfw_u32(h + 4), size = sgfw_u32(h + 16), mem = sgfw_u32(h + 20);
++		if (size > mem || file > n || size > n - file ||
++		    (uint64_t)sgfw_u32(h + 8) + mem > 0x100000000ULL ||
++		    (uint64_t)sgfw_u32(h + 12) + mem > 0x100000000ULL) { return false; }
++		loaded |= size != 0;
++	}
++	return loaded;
++}
++static inline bool
++sweet_gpu_fw_parse(const uint8_t *p, size_t n, sweet_gpu_fw_hash hash,
++    struct sweet_gpu_fw_image out[3])
++{
++	static const uint8_t magic[] = {'S','W','G','P','U','F','W','1'};
++	struct sweet_gpu_fw_image images[3];
++	if (!p || !hash || !out || n < 256 || n > SWEET_GPU_FW_LIMIT) { return false; }
++	for (unsigned i = 0; i < sizeof(magic); i++) {
++		if (p[i] != magic[i]) { return false; }
++	}
++	if (sgfw_u32(p + 8) != 1 || sgfw_u32(p + 12) != 3 ||
++	    !sgfw_zero(p + 16, 16) || !sgfw_zero(p + 200, 56)) { return false; }
++	size_t cursor = 256;
++	for (unsigned i = 0; i < 3; i++) {
++		const uint8_t *e = p + 32 + i * 56;
++		uint64_t off = sgfw_u64(e + 8), len = sgfw_u64(e + 16);
++		if (sgfw_u32(e) != i + 1 || sgfw_u32(e + 4) || off != cursor ||
++		    !len || off > n || len > n - off) { return false; }
++		size_t end = (size_t)(off + len);
++		cursor = (end + 63u) & ~(size_t)63u;
++		if (cursor > n || !sgfw_zero(p + end, cursor - end) ||
++		    !hash(p + (size_t)off, (size_t)len, e + 24)) { return false; }
++		images[i].data = p + (size_t)off;
++		images[i].size = (size_t)len;
++	}
++	if (cursor != n) { return false; }
++	const uint8_t *gmu = images[0].data;
++	size_t size = images[0].size;
++	if (size < 8 || size > 0x8000 || (size & 3u) || !sgfw_u32(gmu) ||
++	    (sgfw_u32(gmu) & 7u) || !(sgfw_u32(gmu + 4) & 1u) ||
++	    (sgfw_u32(gmu + 4) & ~1u) >= size || images[1].size < 8 ||
++	    images[1].size > 0x40000 || (images[1].size & 3u) ||
++	    !sgfw_zap(images[2].data, images[2].size)) { return false; }
++	/* Publish no partial output on failure. ZAP addresses are never CPU destinations. */
++	for (unsigned i = 0; i < 3; i++) { out[i] = images[i]; }
++	return true;
++}
++#endif
+--- /dev/null
++++ b/bsd/dev/sweet_gpu_firmware.inc
+@@ -0,0 +1,57 @@
++/* Optional CPU-only firmware validation; no firmware is authenticated/executed. */
++#include <pexpert/boot.h>
++#include <pexpert/device_tree.h>
++#include <machine/machine_routines.h>
++#include <corecrypto/ccsha2.h>
++#include <corecrypto/ccdigest.h>
++#include "sweet_gpu_firmware.h"
++
++static bool
++sweet_gpu_fw_digest(const uint8_t *data, size_t size, const uint8_t *expected)
++{
++	uint8_t digest[32];
++	ccdigest(ccsha256_di(), size, data, digest);
++	return memcmp(digest, expected, sizeof(digest)) == 0;
++}
++
++static void
++sweet_gpu_fw_probe(void)
++{
++	int enabled = 0;
++	(void)PE_parse_boot_argn("sweetgpufw", &enabled, sizeof(enabled));
++	if (enabled != 1) { return; }
++	DTEntry entry;
++	const void *property;
++	unsigned property_size = 0;
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &entry) != kSuccess ||
++	    SecureDTGetProperty(entry, "GPUFirmware", &property, &property_size) != kSuccess ||
++	    property_size != 16 || !PE_state.bootArgs) {
++		printf("SWEET GPU: firmware mapping absent/invalid; no upload\n");
++		return;
++	}
++	const uint8_t *range = property;
++	uint64_t pa = sgfw_u64(range), size = sgfw_u64(range + 8);
++	const boot_args *args = PE_state.bootArgs;
++	/* Only boot-reserved RAM, through its existing normal-memory mapping.
++	 * Never map this RAM as Device memory; never translate any ELF p_paddr.
++	 */
++	if ((pa & 0x3fffu) || size < 256 || size > SWEET_GPU_FW_LIMIT ||
++	    pa < args->physBase || pa >= args->topOfKernelData ||
++	    size > args->topOfKernelData - pa || pa - args->physBase > args->memSize ||
++	    size > args->memSize - (pa - args->physBase)) {
++		printf("SWEET GPU: firmware outside reserved RAM; no upload\n");
++		return;
++	}
++	vm_offset_t va = ml_static_ptovirt((vm_offset_t)pa);
++	if (!va || ml_static_ptovirt((vm_offset_t)(pa + size - 1)) != va + size - 1) {
++		printf("SWEET GPU: firmware CPU mapping invalid; no upload\n");
++		return;
++	}
++	struct sweet_gpu_fw_image images[3];
++	if (!sweet_gpu_fw_parse((const uint8_t *)va, (size_t)size, sweet_gpu_fw_digest, images)) {
++		printf("SWEET GPU: firmware container/format/hash rejected; no upload\n");
++		return;
++	}
++	printf("SWEET GPU: firmware validated in CPU RAM: GMU=%lu SQE=%lu ZAP=%lu; no upload/authentication/execution\n",
++	    (unsigned long)images[0].size, (unsigned long)images[1].size, (unsigned long)images[2].size);
++}
